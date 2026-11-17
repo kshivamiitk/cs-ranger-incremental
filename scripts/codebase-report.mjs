@@ -44,5 +44,6 @@ const application = rows.filter(({ path }) =>
   /^(frontend\/src\/|backend\/[^/]+\/src\/|backend\/shared\/|database\/)/.test(path)
   && !/\.(test|spec)\.[^/]+$/.test(path));
 console.log(`Application and database only: ${application.length} files, ${application.reduce((n, row) => n + row.lines, 0)} physical lines (excludes tests, utility scripts, and build/test configuration).\n`);
+console.log(`Reachable commits: ${execFileSync("git", ["rev-list", "--count", "HEAD"], { cwd: root, encoding: "utf8" }).trim()}\n`);
 console.log("Largest source files (starting points for focused refactoring):");
 console.table(rows.sort((a, b) => b.lines - a.lines || a.path.localeCompare(b.path)).slice(0, 15));
