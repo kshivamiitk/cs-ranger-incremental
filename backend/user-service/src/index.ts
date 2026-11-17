@@ -3,6 +3,7 @@ import { z } from "zod";
 import { registerAdminRoutes } from "./admin.js";
 import { registerUploadRoutes } from "./uploads.js";
 import { registerOnboardingRoutes } from "./onboarding.js";
+import { registerStudyRoutes } from "./study/routes.js";
 
 const { app, listen } = createService("user-service");
 const PORT = Number(process.env.PORT_USER || 4002);
@@ -14,6 +15,7 @@ registerAdminRoutes(app);
 registerUploadRoutes(app);
 // Resumable 4-step onboarding (/me/onboarding*).
 registerOnboardingRoutes(app);
+registerStudyRoutes(app);
 
 app.get("/me", requireAuth, async (req, res) => {
   const profile = await withDb(async (db) => {
