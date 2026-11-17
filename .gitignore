@@ -42,3 +42,6 @@ backend/.grant-storage.mjs
 *business-setup*
 claude-marjoram-tmux-transcript.txt
 project_bundle.txt
+
+# Private local development study workspace storage
+.local/
