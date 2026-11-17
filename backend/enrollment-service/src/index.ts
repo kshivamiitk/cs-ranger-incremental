@@ -1,0 +1,369 @@
+import { createService, ok, fail, requireAuth, withDb, supabaseAdmin, isSupabaseConfigured, consume, Topics, publish, sendCourseIntroEmail } from "@cs-ranger/shared";
+import { z } from "zod";
+import { applyProgress, getNodeCore, onCourseCompleted, recomputeCourseProgress, type CourseProgressResult } from "./completion.js";
+import type { SupabaseClient } from "@supabase/supabase-js";
+
+// Active access = an unexpired enrollment (NULL expiry = permanent), the course
+// owner, or an admin. Gates the progress/quiz endpoints so a non-enrolled (or
+// expired) user can't fake progress, pass quizzes, or trigger a certificate by
+// hitting the API directly with a guessed nodeId.
+async function canAccessCourse(db: SupabaseClient, userId: string, role: string | undefined, courseId: string): Promise<boolean> {
+  const { data: enr } = await db.from("enrollments").select("access_expires_at").eq("learner_id", userId).eq("course_id", courseId).maybeSingle();
+  if (enr) {
+    const exp = (enr as { access_expires_at?: string | null }).access_expires_at ?? null;
+    if (exp === null || new Date(exp).getTime() > Date.now()) return true;
+  }
+  if (role === "admin") return true;
+  const { data: course } = await db.from("courses").select("creator_id").eq("id", courseId).maybeSingle();
+  return (course as { creator_id?: string } | null)?.creator_id === userId;
+}
+
+const { app, listen, log } = createService("enrollment-service");
+const PORT = Number(process.env.PORT_ENROLLMENT || 4004);
+
+async function sendCourseIntroBestEffort(learnerId: string, courseId: string, enrollmentId?: string | null): Promise<void> {
+  const result = await withDb((db) => sendCourseIntroEmail(db, { learnerId, courseId, enrollmentId }), null);
+  if (result && !result.skipped && !result.emailSent) {
+    log.warn("course intro email was not sent", { learnerId, courseId, reason: result.reason });
+  }
+}
+
+// ─── Listen for payment.verified → legacy enrollment fallback ────
+consume<{ paymentId: string; courseId: string; learnerId: string; amount: number }>(Topics.PAYMENT_VERIFIED, async ({ courseId, learnerId }) => {
+  const enrollment = await withDb(async (db) => {
+    const { data: existing, error: readError } = await db.from("enrollments")
+      .select("id").eq("learner_id", learnerId).eq("course_id", courseId).maybeSingle();
+    if (readError) throw readError;
+    if (existing) return { id: (existing as { id: string }).id, created: false };
+
+    // verify_payment() normally creates paid access inside the payment
+    // transaction. This path is only a compatibility fallback for older/manual
+    // payment.verified publishers, so give the learner the same 30-day window.
+    const { data, error } = await db.from("enrollments").insert({
+      learner_id: learnerId,
+      course_id: courseId,
+      progress_percent: 0,
+      access_expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+    }).select("id").single();
+    if (error) {
+      if ((error as { code?: string }).code === "23505") return { id: null, created: false };
+      throw error;
+    }
+    return { id: (data as { id: string }).id, created: true };
+  }, null);
+
+  if (enrollment?.created && enrollment.id) {
+    await sendCourseIntroBestEffort(learnerId, courseId, enrollment.id);
+    await publish(Topics.ENROLLMENT_CREATED, { enrollmentId: enrollment.id, learnerId, courseId });
+    log.info("enrollment created from payment.verified fallback", { courseId, learnerId });
+  } else {
+    log.info("payment.verified enrollment already exists", { courseId, learnerId });
+  }
+});
+
+// ─── Listen for payment.refunded → revoke enrollment ──────────────
+consume<{ courseId: string; learnerId: string }>(Topics.PAYMENT_REFUNDED, async ({ courseId, learnerId }) => {
+  await withDb(async (db) => {
+    await db.from("enrollments").delete().eq("learner_id", learnerId).eq("course_id", courseId);
+    return null;
+  }, null);
+});
+
+// ─── REST endpoints ──────────────────────────────────────────────
+app.get("/check", requireAuth, async (req, res) => {
+  const courseId = String(req.query.courseId || "");
+  if (!courseId) return fail(res, 400, "courseId required", "VALIDATION");
+  if (!isSupabaseConfigured()) return ok(res, { enrolled: false });
+  // CRITICAL: do NOT swallow a DB error into enrolled:false. withDb's fallback
+  // would report a transient failure (e.g. a latency blip) as "not enrolled",
+  // which locks a paying learner out of a course they own — and because it's a
+  // *successful* response the client never retries. Surface a real error
+  // instead so the client retries and the gate only ever closes on a genuine
+  // "no enrollment row", never on a hiccup.
+  try {
+    const { data, error } = await supabaseAdmin()
+      .from("enrollments")
+      .select("id, progress_percent, last_node_id, access_expires_at")
+      .eq("learner_id", req.user!.id)
+      .eq("course_id", courseId)
+      .maybeSingle();
+    if (error) throw error;
+    // Per-month access: enrolled === has an UNEXPIRED window (NULL = permanent).
+    const expiresAt = (data as { access_expires_at?: string | null } | null)?.access_expires_at ?? null;
+    const active = !!data && (expiresAt === null || new Date(expiresAt).getTime() > Date.now());
+    ok(res, {
+      enrolled: active,
+      expired: !!data && !active,
+      access_expires_at: expiresAt,
+      progress_percent: (data as { progress_percent?: number } | null)?.progress_percent,
+      last_node_id: (data as { last_node_id?: string } | null)?.last_node_id,
+    });
+  } catch (err) {
+    const e = err as { message?: string; code?: string };
+    log.error("enrollment check failed", { courseId, learnerId: req.user!.id, err: e?.message, code: e?.code });
+    fail(res, 503, "Could not verify enrollment — please retry", "CHECK_FAILED");
+  }
+});
+
+app.get("/", requireAuth, async (req, res) => {
+  // Lean select — the My Courses / Home cards only display these fields, and
+  // the page was returning [] before because PostgREST can't auto-resolve the
+  // courses→profiles relationship (courses.creator_id FKs users, not profiles).
+  // Uses idx_enrollments_learner_last (learner_id, last_accessed_at desc).
+  const list = await withDb(async (db) => {
+    const { data } = await db.from("enrollments")
+      .select("id, course_id, progress_percent, last_node_id, last_accessed_at, completed_at, enrolled_at, access_expires_at, courses(id, title, thumbnail_url, duration_seconds, certificate_enabled)")
+      .eq("learner_id", req.user!.id)
+      .order("last_accessed_at", { ascending: false });
+    return data || [];
+  }, () => []);
+  ok(res, list);
+});
+
+// Free-course enrollment
+const FreeEnroll = z.object({ courseId: z.string() });
+app.post("/", requireAuth, async (req, res) => {
+  const parsed = FreeEnroll.safeParse(req.body);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message, "VALIDATION");
+
+  const course = await withDb(async (db) => {
+    const { data } = await db.from("courses").select("id, price, status").eq("id", parsed.data.courseId).maybeSingle();
+    return data;
+  }, null);
+  if (!course) return fail(res, 404, "Course not found", "NOT_FOUND");
+  if (course.status !== "published") return fail(res, 400, "Course not available", "UNAVAILABLE");
+  if (course.price && course.price > 0) return fail(res, 400, "Course is paid — use payment flow", "PAID_COURSE");
+
+  const result = await withDb(async (db) => {
+    const { data, error } = await db.from("enrollments").insert({
+      learner_id: req.user!.id, course_id: course.id, progress_percent: 0,
+    }).select("*").single();
+    if (error) throw error;
+    return data;
+  }, null);
+  if (!result) return fail(res, 409, "Already enrolled", "ALREADY_ENROLLED");
+
+  await sendCourseIntroBestEffort(req.user!.id, course.id, result.id);
+  await publish(Topics.ENROLLMENT_CREATED, { enrollmentId: result.id, learnerId: req.user!.id, courseId: course.id });
+  res.status(201);
+  ok(res, result);
+});
+
+// ─── Completion engine ────────────────────────────────────────────
+// Unified, idempotent progress update. The player streams scroll/watch signals
+// here; the per-node-type policy (completion.ts) decides when a node flips to
+// completed, and course progress is recomputed from the course's actual node set.
+const ProgressUpdate = z.object({
+  scrollPercent: z.number().min(0, "scrollPercent cannot be negative").max(100, "scrollPercent cannot exceed 100").optional(),
+  watchSeconds: z.number().min(0, "watchSeconds cannot be negative").max(86_400).optional(),
+  durationSeconds: z.number().min(0).max(86_400).optional(),
+  lastPositionSeconds: z.number().min(0).max(86_400).optional(),
+  markDone: z.boolean().optional(),
+}).strict();
+
+type ProgressResponse = {
+  completed: boolean; newlyCompleted: boolean; completedByRule: string | null;
+  scrollPercent: number; watchSeconds: number;
+} & Partial<CourseProgressResult> & { quizRequired?: boolean };
+
+async function handleProgressUpdate(learnerId: string, role: string | undefined, nodeId: string, signal: z.infer<typeof ProgressUpdate>): Promise<ProgressResponse | { error: { status: number; message: string; code: string } }> {
+  return withDb<ProgressResponse | { error: { status: number; message: string; code: string } }>(async (db) => {
+    const node = await getNodeCore(db, nodeId);
+    if (!node) return { error: { status: 404, message: "Lesson not found", code: "NOT_FOUND" } };
+    if (!(await canAccessCourse(db, learnerId, role, node.course_id))) {
+      return { error: { status: 403, message: "You need active access to this course to track progress", code: "NO_ACCESS" } };
+    }
+    if (node.type === "folder") {
+      return { error: { status: 400, message: "Folders are not completable lessons", code: "FOLDER_NOT_LESSON" } };
+    }
+    if (node.type === "quiz" && signal.markDone) {
+      return { error: { status: 400, message: "Quizzes are completed by reaching the passing score, not by marking done", code: "QUIZ_PASS_REQUIRED" } };
+    }
+
+    const result = await applyProgress(db, learnerId, node, signal);
+    let course: CourseProgressResult | null = null;
+    if (result.newlyCompleted || signal.markDone) {
+      course = await recomputeCourseProgress(db, learnerId, node.course_id, nodeId);
+      if (course?.courseJustCompleted) await onCourseCompleted(db, learnerId, node.course_id);
+    } else {
+      // Light "continue learning" touch — keeps last_node_id fresh without a full recompute.
+      await db.from("enrollments").update({ last_node_id: nodeId, last_accessed_at: new Date().toISOString() })
+        .eq("learner_id", learnerId).eq("course_id", node.course_id);
+    }
+    return { ...result, ...(course || {}), quizRequired: node.type === "quiz" || undefined };
+  }, () => ({
+    completed: !!signal.markDone, newlyCompleted: !!signal.markDone, completedByRule: signal.markDone ? "manual" : null,
+    scrollPercent: Math.round(signal.scrollPercent || 0), watchSeconds: Math.round(signal.watchSeconds || 0),
+    courseProgressPercent: 0, courseCompleted: false, courseJustCompleted: false,
+  }));
+}
+
+app.post("/progress/:nodeId", requireAuth, async (req, res) => {
+  const parsed = ProgressUpdate.safeParse(req.body);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message, "VALIDATION");
+  const result = await handleProgressUpdate(req.user!.id, req.user!.role, String(req.params.nodeId), parsed.data);
+  if ("error" in result) return fail(res, result.error.status, result.error.message, result.error.code);
+  if (result.newlyCompleted) await publish(Topics.NODE_COMPLETED, { learnerId: req.user!.id, nodeId: req.params.nodeId });
+  ok(res, result);
+});
+
+// Mark a node complete (legacy explicit Mark-as-Done — same policy path; quizzes are rejected).
+app.post("/progress/:nodeId/complete", requireAuth, async (req, res) => {
+  const result = await handleProgressUpdate(req.user!.id, req.user!.role, String(req.params.nodeId), { markDone: true });
+  if ("error" in result) return fail(res, result.error.status, result.error.message, result.error.code);
+  if (result.newlyCompleted) await publish(Topics.NODE_COMPLETED, { learnerId: req.user!.id, nodeId: req.params.nodeId });
+  ok(res, result);
+});
+
+// Save watch position (video, every 10s)
+app.put("/progress/:nodeId/watch-position", requireAuth, async (req, res) => {
+  const seconds = Math.max(0, Math.floor(Number(req.body.seconds || 0)));
+  // Same active-access gate as the progress/quiz paths: resolve the node to its
+  // course and require enrollment (or ownership/admin) before writing — a
+  // non-enrolled user shouldn't be able to seed node_progress rows for arbitrary
+  // lessons.
+  const result = await withDb<"ok" | "not_found" | "forbidden">(async (db) => {
+    const node = await getNodeCore(db, String(req.params.nodeId));
+    if (!node) return "not_found";
+    if (!(await canAccessCourse(db, req.user!.id, req.user!.role, node.course_id))) return "forbidden";
+    await db.from("node_progress").upsert({
+      learner_id: req.user!.id, node_id: req.params.nodeId,
+      watch_position_s: seconds, last_accessed_at: new Date().toISOString(),
+    }, { onConflict: "learner_id,node_id" });
+    return "ok";
+  }, "ok");
+  if (result === "not_found") return fail(res, 404, "Lesson not found", "NOT_FOUND");
+  if (result === "forbidden") return fail(res, 403, "You need active access to this course", "NO_ACCESS");
+  ok(res, { saved: true });
+});
+
+app.get("/progress/:nodeId/watch-position", requireAuth, async (req, res) => {
+  const row = await withDb(async (db) => {
+    const { data } = await db.from("node_progress").select("watch_position_s, is_completed").eq("learner_id", req.user!.id).eq("node_id", req.params.nodeId).maybeSingle();
+    return data;
+  }, null);
+  ok(res, { seconds: row?.watch_position_s || 0, completed: !!row?.is_completed });
+});
+
+// Per-course progress (used by the player sidebar)
+app.get("/:courseId/progress", requireAuth, async (req, res) => {
+  const result = await withDb(async (db) => {
+    const [{ data: enrollment }, { data: completed }] = await Promise.all([
+      db.from("enrollments").select("progress_percent, completed_at, last_node_id").eq("learner_id", req.user!.id).eq("course_id", req.params.courseId).maybeSingle(),
+      db.from("node_progress").select("node_id, nodes!inner(type)").eq("learner_id", req.user!.id).eq("is_completed", true).neq("nodes.type", "folder"),
+    ]);
+    return { enrollment, completedNodeIds: completed?.map((c) => c.node_id) || [] };
+  }, () => ({ enrollment: null, completedNodeIds: [] }));
+  ok(res, result);
+});
+
+// Quiz attempt submission — completion only happens on a passing score.
+const QuizSubmit = z.object({
+  answers: z.array(z.object({ questionId: z.string(), pickedIndex: z.number().int().min(0).max(3) })),
+});
+// The answer key is returned only to a learner who has just submitted an attempt
+// (or who has past attempts) — never embedded in the course content payload — so
+// answers can't be read ahead of time, but the post-submit/review UI can still
+// show which option was correct.
+type AnswerKeyEntry = { questionId: string; correctIndex: number; explanation?: string };
+type QuizAttemptResult = {
+  score: number; max: number; passed: boolean; attemptId?: string; answerKey?: AnswerKeyEntry[];
+} & Partial<CourseProgressResult>;
+app.post("/quiz/:nodeId/attempt", requireAuth, async (req, res) => {
+  const parsed = QuizSubmit.safeParse(req.body);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message, "VALIDATION");
+
+  const result = await withDb<QuizAttemptResult | { forbidden: true } | null>(async (db) => {
+    const core = await getNodeCore(db, String(req.params.nodeId));
+    if (!core) return null;
+    if (!(await canAccessCourse(db, req.user!.id, req.user!.role, core.course_id))) return { forbidden: true } as const;
+    const { data: node } = await db.from("nodes").select("quiz_payload, module_id").eq("id", req.params.nodeId).maybeSingle();
+    if (!node?.quiz_payload) return null;
+    type QP = { questions: { id: string; correctIndex: number; explanation?: string }[]; passingPercent?: number };
+    const qp = node.quiz_payload as QP;
+    let score = 0;
+    for (const a of parsed.data.answers) {
+      const q = qp.questions.find((x) => x.id === a.questionId);
+      if (q && q.correctIndex === a.pickedIndex) score++;
+    }
+    const max = qp.questions.length;
+    const passing = qp.passingPercent || 60;
+    const passed = max > 0 && (score / max) * 100 >= passing;
+    // The grader has the key in hand — return it so the player can show correct
+    // answers right after submitting (it's no longer in the course payload).
+    const answerKey: AnswerKeyEntry[] = qp.questions.map((q) => ({ questionId: q.id, correctIndex: q.correctIndex, explanation: q.explanation }));
+
+    const { data: attempt } = await db.from("quiz_attempts").insert({
+      learner_id: req.user!.id, node_id: req.params.nodeId,
+      answers: parsed.data.answers, score, max_score: max, passed,
+    }).select("id").single();
+
+    let course: CourseProgressResult | null = null;
+    if (passed) {
+      const core = await getNodeCore(db, String(req.params.nodeId));
+      if (core) {
+        const applied = await applyProgress(db, req.user!.id, core, {}, { completed: true, rule: "quiz_pass", quizAttemptId: attempt?.id });
+        if (applied.newlyCompleted) {
+          course = await recomputeCourseProgress(db, req.user!.id, core.course_id, core.id);
+          if (course?.courseJustCompleted) await onCourseCompleted(db, req.user!.id, core.course_id);
+        }
+      }
+    }
+    return { score, max, passed, attemptId: attempt?.id, answerKey, ...(course || {}) };
+  }, () => ({ score: 0, max: 0, passed: false }));
+
+  if (result && "forbidden" in result) return fail(res, 403, "You need active access to this course to attempt its quiz", "NO_ACCESS");
+  if (!result) return fail(res, 404, "Quiz node not found", "NOT_FOUND");
+  if (result.passed) await publish(Topics.NODE_COMPLETED, { learnerId: req.user!.id, nodeId: req.params.nodeId });
+  ok(res, result);
+});
+
+// Past attempts for review mode — read-only history, never editable. Returns the
+// answer key alongside the attempts ONLY when the learner already has at least
+// one attempt (so review can show correct answers), never to someone who hasn't
+// attempted — the course payload no longer carries the answers.
+app.get("/quiz/:nodeId/attempts", requireAuth, async (req, res) => {
+  const result = await withDb(async (db) => {
+    const { data } = await db.from("quiz_attempts")
+      .select("id, score, max_score, passed, answers, attempted_at")
+      .eq("learner_id", req.user!.id).eq("node_id", req.params.nodeId)
+      .order("attempted_at", { ascending: false })
+      .limit(20);
+    const attempts = data || [];
+    let answerKey: { questionId: string; correctIndex: number; explanation?: string }[] = [];
+    if (attempts.length > 0) {
+      const { data: node } = await db.from("nodes").select("quiz_payload").eq("id", req.params.nodeId).maybeSingle();
+      const qp = node?.quiz_payload as { questions?: { id: string; correctIndex: number; explanation?: string }[] } | undefined;
+      answerKey = (qp?.questions || []).map((q) => ({ questionId: q.id, correctIndex: q.correctIndex, explanation: q.explanation }));
+    }
+    return { attempts, answerKey };
+  }, () => ({ attempts: [], answerKey: [] }));
+  ok(res, result);
+});
+
+// Learner notes (timestamped against video)
+app.get("/notes/:nodeId", requireAuth, async (req, res) => {
+  const list = await withDb(async (db) => {
+    const { data } = await db.from("learner_notes").select("*").eq("learner_id", req.user!.id).eq("node_id", req.params.nodeId).order("timestamp_s");
+    return data || [];
+  }, () => []);
+  ok(res, list);
+});
+
+app.post("/notes/:nodeId", requireAuth, async (req, res) => {
+  const body = String(req.body.body || ""); const timestamp = req.body.timestamp_s;
+  if (!body) return fail(res, 400, "body required", "VALIDATION");
+  // Require active access to the node's course before creating a note against it.
+  const result = await withDb<"ok" | "not_found" | "forbidden">(async (db) => {
+    const node = await getNodeCore(db, String(req.params.nodeId));
+    if (!node) return "not_found";
+    if (!(await canAccessCourse(db, req.user!.id, req.user!.role, node.course_id))) return "forbidden";
+    await db.from("learner_notes").insert({ learner_id: req.user!.id, node_id: req.params.nodeId, body, timestamp_s: timestamp });
+    return "ok";
+  }, "ok");
+  if (result === "not_found") return fail(res, 404, "Lesson not found", "NOT_FOUND");
+  if (result === "forbidden") return fail(res, 403, "You need active access to this course", "NO_ACCESS");
+  ok(res, { saved: true });
+});
+
+listen(PORT);
