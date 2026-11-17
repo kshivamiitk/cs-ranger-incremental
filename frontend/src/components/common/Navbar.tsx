@@ -17,6 +17,7 @@ import { cn } from "@/lib/utils";
 const LEARNER_LINKS = [
   { href: "/home", label: "Home" },
   { href: "/my-courses", label: "My Courses" },
+  { href: "/study", label: "Study" },
   { href: "/catalog", label: "Catalog" },
   { href: "/feed", label: "Feed" },
   { href: "/creators", label: "Creators" },
