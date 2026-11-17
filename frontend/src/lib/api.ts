@@ -79,7 +79,7 @@ async function refreshAccessToken(): Promise<string | null> {
   }
 }
 
-function axiosClient(): AxiosInstance {
+export function axiosClient(): AxiosInstance {
   if (_axios) return _axios;
   _axios = axios.create({
     baseURL: API_URL,
