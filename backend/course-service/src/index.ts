@@ -1,0 +1,1535 @@
+import { createService, ok, fail, mock, requireAuth, requireRole, withDb, isSupabaseConfigured, publish, Topics, bustPrefix, withCache, razorpay, isRazorpayConfigured, verifyPaymentSignature, sendRealtimeNotification, getPlatformSetting, deleteStoredFile, type Course } from "@cs-ranger/shared";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import type { Request as ExpressRequest } from "express";
+import { z } from "zod";
+import { randomUUID } from "node:crypto";
+import { registerCourseUploadRoutes } from "./uploads.js";
+import { registerModerationRoutes } from "./moderation.js";
+import { NodeVideoExtras, VideoChapters, VideoSubtitles } from "./validation.js";
+import { resolveCoursePricing } from "./pricing.js";
+import { sortCourseTree, type WithPosition } from "./ordering.js";
+
+import { courseEditorRole, moduleCourseId, nodeCourseId, assertCanWriteCourse, type WriteCheck } from "./access.js";
+import { registerReviewRoutes } from "./reviews.js";
+import { registerBookmarkRoutes } from "./bookmarks.js";
+import { registerCollaborationRoutes } from "./collaboration.js";
+import { registerCourseLockRoutes } from "./locks.js";
+
+// ─── Creator storage quota ────────────────────────────────────────
+// Tunable per deployment via root .env. Hard cap on lesson-PDF uploads
+// per creator. The counter lives in creator_storage.bytes_used, maintained by
+// explicit app-side commits for uploaded files and a nodes trigger for static
+// website payloads — so the per-upload check is one indexed primary-key lookup.
+const STORAGE_FREE_MB = Number(process.env.CREATOR_STORAGE_FREE_MB || 2);
+const STORAGE_PRICE_PER_MB_INR = Number(process.env.CREATOR_STORAGE_PRICE_PER_MB_INR || 5);
+const STORAGE_DURATION_DAYS = Number(process.env.CREATOR_STORAGE_DURATION_DAYS || 30);
+const BYTES_PER_MB = 1024 * 1024;
+const PDF_BUCKET = "node-pdfs";
+const PDF_MAX_BYTES = 26_214_400; // 25 MiB, matches storage.buckets.file_size_limit
+const PDF_VIEW_TTL_SECONDS = 60 * 60; // 1h — long enough to read, short enough that a leaked URL goes stale fast.
+
+type StorageState = {
+  bytes_used: number;
+  extra_bytes: number;
+  extra_until: string | null;
+  effective_extra_bytes: number; // 0 if expired
+  quota_bytes: number;
+  remaining_bytes: number;
+};
+
+async function getCreatorStorage(db: SupabaseClient, creatorId: string): Promise<StorageState> {
+  const { data } = await db.from("creator_storage")
+    .select("bytes_used, extra_bytes, extra_until")
+    .eq("creator_id", creatorId)
+    .maybeSingle();
+  const bytes_used = (data as { bytes_used?: number } | null)?.bytes_used ?? 0;
+  const extra_bytes = (data as { extra_bytes?: number } | null)?.extra_bytes ?? 0;
+  const extra_until = (data as { extra_until?: string | null } | null)?.extra_until ?? null;
+  const extraValid = !!extra_until && new Date(extra_until).getTime() > Date.now();
+  const effective_extra_bytes = extraValid ? extra_bytes : 0;
+  const quota_bytes = STORAGE_FREE_MB * BYTES_PER_MB + effective_extra_bytes;
+  return {
+    bytes_used, extra_bytes, extra_until,
+    effective_extra_bytes,
+    quota_bytes,
+    remaining_bytes: Math.max(0, quota_bytes - bytes_used),
+  };
+}
+
+function publishStorageQuotaError(state: StorageState) {
+  if (state.bytes_used <= state.quota_bytes) return null;
+  return {
+    quotaExceeded: true,
+    used: state.bytes_used,
+    quota: state.quota_bytes,
+    needed: state.bytes_used - state.quota_bytes,
+    priceInrPerMb: STORAGE_PRICE_PER_MB_INR,
+  } as const;
+}
+
+function staticWebsitePayloadBytes(payload: unknown): number {
+  if (!payload) return 0;
+  return Buffer.byteLength(JSON.stringify(payload), "utf8");
+}
+
+function storageQuotaDeltaError(state: StorageState, deltaBytes: number) {
+  if (deltaBytes <= 0) return null;
+  const projected = state.bytes_used + deltaBytes;
+  if (projected <= state.quota_bytes) return null;
+  return {
+    overQuota: true,
+    used: state.bytes_used,
+    quota: state.quota_bytes,
+    needed: projected - state.quota_bytes,
+    priceInrPerMb: STORAGE_PRICE_PER_MB_INR,
+  } as const;
+}
+
+/**
+ * Refresh the catalog snapshot when a course's published-or-not state
+ * changes. Two things happen:
+ *   1. REFRESH MATERIALIZED VIEW CONCURRENTLY popular_courses — so the new
+ *      course appears in the catalog (or disappears on unpublish) immediately,
+ *      without waiting for the pg_cron tick.
+ *   2. Drop the search-service's Redis cache for catalog keys so the next
+ *      GET /api/search/courses doesn't serve a stale snapshot.
+ * Both are best-effort: a failure here shouldn't break the publish flow.
+ */
+async function refreshCatalogSnapshot(db: SupabaseClient): Promise<void> {
+  try { await db.rpc("refresh_popular_courses"); } catch { /* best effort */ }
+  await bustPrefix("catalog:v2:");
+}
+
+type UploadedAssetRow = {
+  id: string;
+  owner_id: string;
+  bucket: string;
+  path: string;
+  size_bytes: number;
+  entity_type: string | null;
+  entity_id: string | null;
+};
+
+function addBytes(map: Map<string, number>, ownerId: string | null | undefined, bytes: number) {
+  if (!ownerId || !Number.isFinite(bytes) || bytes <= 0) return;
+  map.set(ownerId, (map.get(ownerId) || 0) + bytes);
+}
+
+function storageMetadataSize(item: unknown): number {
+  const metadata = (item as { metadata?: Record<string, unknown> } | null)?.metadata || {};
+  const raw = metadata.size ?? metadata.contentLength ?? metadata.content_length;
+  const size = Number(raw || 0);
+  return Number.isFinite(size) && size > 0 ? size : 0;
+}
+
+async function storageObjectSize(db: SupabaseClient, bucket: string, storagePath: string): Promise<number> {
+  const cleanPath = storagePath.replace(/^\/+/, "");
+  const parts = cleanPath.split("/");
+  const filename = parts.pop() || "";
+  const prefix = parts.join("/");
+  if (!filename) return 0;
+  try {
+    const { data } = await db.storage.from(bucket).list(prefix, { limit: 1000, search: filename });
+    const item = (data || []).find((entry: { name?: string }) => entry.name === filename);
+    return storageMetadataSize(item);
+  } catch {
+    return 0;
+  }
+}
+
+async function cleanupCourseStorage(db: SupabaseClient, courseId: string) {
+  const { data: modules } = await db.from("modules").select("id").eq("course_id", courseId);
+  const moduleIds = ((modules || []) as { id: string }[]).map((m) => m.id);
+  const { data: nodes } = moduleIds.length
+    ? await db.from("nodes").select("id, type, pdf_url").in("module_id", moduleIds)
+    : { data: [] as unknown[] };
+  const nodeRows = ((nodes || []) as { id: string; type: string; pdf_url?: string | null }[]);
+  const nodeIds = nodeRows.map((n) => n.id);
+
+  const releaseByOwner = new Map<string, number>();
+  const filesToDelete: { bucket: string; path: string }[] = [];
+  const assetRows: UploadedAssetRow[] = [];
+  const uploadedAssetIdsToDelete = new Set<string>();
+
+  for (const node of nodeRows) {
+    if (node.type !== "pdf") continue;
+    const pdfPath = pdfStoragePath(node.pdf_url);
+    if (!pdfPath) continue;
+    const { data: pdfAsset } = await db.from("uploaded_assets")
+      .select("id, owner_id, bucket, path, size_bytes, entity_type, entity_id")
+      .eq("bucket", PDF_BUCKET)
+      .eq("path", pdfPath)
+      .maybeSingle();
+    if (pdfAsset) uploadedAssetIdsToDelete.add((pdfAsset as UploadedAssetRow).id);
+    const size = Number((pdfAsset as { size_bytes?: number } | null)?.size_bytes || 0) || await storageObjectSize(db, PDF_BUCKET, pdfPath);
+    addBytes(releaseByOwner, (pdfAsset as { owner_id?: string } | null)?.owner_id || pdfPath.split("/")[0], size);
+    filesToDelete.push({ bucket: PDF_BUCKET, path: pdfPath });
+  }
+
+  const { data: courseAssets } = await db.from("uploaded_assets")
+    .select("id, owner_id, bucket, path, size_bytes, entity_type, entity_id")
+    .eq("entity_type", "course_thumbnail")
+    .eq("entity_id", courseId);
+  assetRows.push(...((courseAssets || []) as UploadedAssetRow[]));
+
+  if (nodeIds.length > 0) {
+    const { data: nodeAssets } = await db.from("uploaded_assets")
+      .select("id, owner_id, bucket, path, size_bytes, entity_type, entity_id")
+      .in("entity_type", ["node_attachment", "rich_image"])
+      .in("entity_id", nodeIds);
+    assetRows.push(...((nodeAssets || []) as UploadedAssetRow[]));
+  }
+
+  for (const asset of assetRows) {
+    filesToDelete.push({ bucket: asset.bucket, path: asset.path });
+    if (asset.entity_type === "node_attachment" || asset.entity_type === "rich_image") {
+      addBytes(releaseByOwner, asset.owner_id, Number(asset.size_bytes || 0));
+    }
+  }
+
+  for (const [ownerId, bytes] of releaseByOwner.entries()) {
+    await db.rpc("release_storage", { p_creator_id: ownerId, p_bytes: bytes });
+  }
+
+  if (assetRows.length > 0) {
+    for (const asset of assetRows) uploadedAssetIdsToDelete.add(asset.id);
+  }
+  if (uploadedAssetIdsToDelete.size > 0) {
+    await db.from("uploaded_assets").delete().in("id", [...uploadedAssetIdsToDelete]);
+  }
+
+  // Delete nodes while their module/course parents still exist. The
+  // static-website storage trigger needs those parents to find the creator.
+  if (nodeIds.length > 0) {
+    await db.from("nodes").delete().in("id", nodeIds);
+  }
+
+  for (const file of filesToDelete) {
+    await deleteStoredFile(file.bucket, file.path);
+  }
+
+  return {
+    filesDeleted: filesToDelete.length,
+    bytesReleased: [...releaseByOwner.values()].reduce((sum, bytes) => sum + bytes, 0),
+  };
+}
+
+const { app, listen } = createService("course-service");
+const PORT = Number(process.env.PORT_COURSE || 4003);
+
+// Storage upload pipeline (thumbnails, node attachments) — literal /uploads/*
+// and /nodes/:nodeId/attachments routes, registered before the /:id params.
+registerCourseUploadRoutes(app, { courseEditorRole, nodeCourseId });
+// Content reporting + admin flagged-content queue.
+registerModerationRoutes(app, { nodeCourseId, refreshCatalogSnapshot });
+
+// Explicit summary columns for list/card views. Avoids select("*") which drags
+// heavy/unused fields (description, tags, search_vector, promo_video_url) over the
+// wire on the catalog and creator/admin tables.
+const COURSE_SUMMARY_COLS =
+  "id, creator_id, title, subtitle, thumbnail_url, status, price, discounted_price, rating_avg, rating_count, enrollment_count, category_id, level, language, duration_seconds, published_at, created_at";
+
+// ─── Categories ──────────────────────────────────────────────────
+app.get("/categories", async (_req, res) => {
+  const list = await withDb(async (db) => {
+    const { data } = await db.from("categories").select("*").order("position");
+    return data || [];
+  }, () => mock.categories);
+  ok(res, list);
+});
+
+// Admin category management. (RLS also restricts writes to admins; this is the
+// missing CRUD that left the admin "Categories" page unable to add anything.)
+const slugify = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60);
+const CategoryWrite = z.object({
+  name: z.string().min(1).max(60),
+  slug: z.string().min(1).max(60).regex(/^[a-z0-9-]+$/, "slug: lowercase letters, numbers and hyphens only").optional(),
+  icon: z.string().max(16).optional(),
+  position: z.number().int().min(0).optional(),
+});
+
+app.post("/categories", requireRole("admin"), async (req, res) => {
+  const parsed = CategoryWrite.safeParse(req.body);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message, "VALIDATION");
+  const name = parsed.data.name.trim();
+  const slug = parsed.data.slug || slugify(name);
+  if (!slug) return fail(res, 400, "Could not derive a slug from the name", "VALIDATION");
+  const result = await withDb(async (db) => {
+    const { data, error } = await db.from("categories")
+      .insert({ name, slug, icon: parsed.data.icon || null, position: parsed.data.position ?? 0 })
+      .select("*").single();
+    if (error) throw error;
+    return data;
+  }, null);
+  if (!result) return fail(res, 409, "A category with that name or slug already exists", "DUPLICATE");
+  res.status(201);
+  ok(res, result);
+});
+
+app.patch("/categories/:id", requireRole("admin"), async (req, res) => {
+  const parsed = CategoryWrite.partial().safeParse(req.body);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message, "VALIDATION");
+  const patch: Record<string, unknown> = {};
+  if (parsed.data.name !== undefined) patch.name = parsed.data.name.trim();
+  if (parsed.data.slug !== undefined) patch.slug = parsed.data.slug;
+  if (parsed.data.icon !== undefined) patch.icon = parsed.data.icon || null;
+  if (parsed.data.position !== undefined) patch.position = parsed.data.position;
+  if (Object.keys(patch).length === 0) return fail(res, 400, "Nothing to update", "VALIDATION");
+  const result = await withDb(async (db) => {
+    const { data, error } = await db.from("categories").update(patch).eq("id", req.params.id).select("*").single();
+    if (error) throw error;
+    return data;
+  }, null);
+  if (!result) return fail(res, 404, "Category not found, or the name/slug is taken", "NOT_FOUND");
+  ok(res, result);
+});
+
+app.delete("/categories/:id", requireRole("admin"), async (req, res) => {
+  // courses.category_id is ON DELETE SET NULL, so affected courses are simply
+  // uncategorized — no course data is lost.
+  await withDb(async (db) => {
+    await db.from("categories").delete().eq("id", req.params.id);
+    return null;
+  }, null);
+  ok(res, { deleted: true });
+});
+
+// ─── Course listing (catalog) ────────────────────────────────────
+app.get("/", async (req, res) => {
+  const page = Math.max(1, Number(req.query.page || 1));
+  const pageSize = Math.min(60, Math.max(1, Number(req.query.pageSize || 20)));
+  const list = await withDb(async (db) => {
+    let q = db.from("courses").select(COURSE_SUMMARY_COLS, { count: "exact" }).eq("status", "published").order("enrollment_count", { ascending: false });
+    if (req.query.category) q = q.eq("category_id", req.query.category as string);
+    if (req.query.creatorId) q = q.eq("creator_id", req.query.creatorId as string);
+    if (req.query.minRating) q = q.gte("rating_avg", Number(req.query.minRating));
+    q = q.range((page - 1) * pageSize, page * pageSize - 1);
+    const { data, count } = await q;
+    // Cast bridges the snake_case DB row shape to the camelCase mock Course type that
+    // withDb infers from the fallback; the wire payload is the snake_case row the FE expects.
+    return { items: (data || []) as unknown as Course[], total: count || 0 };
+  }, () => {
+    const all = mock.courses.filter((c) => c.status === "published");
+    return { items: all.slice((page - 1) * pageSize, page * pageSize), total: all.length };
+  });
+  ok(res, list.items, { page, pageSize, total: list.total });
+});
+
+// ─── Creator's own active courses ────────────────────────────────
+// Defined before "/:id" so the literal "/mine" path is not captured by the
+// id param. Scoped server-side to the authenticated creator — replaces the old
+// pattern of fetching the whole published catalog and filtering by creator_id
+// on the client. Archived courses are operational tombstones for audit/payment
+// history and should not clutter the creator dashboard.
+app.get("/mine", requireAuth, async (req, res) => {
+  const list = await withDb(async (db) => {
+    const { data } = await db.from("courses")
+      .select(COURSE_SUMMARY_COLS)
+      .eq("creator_id", req.user!.id)
+      .neq("status", "archived")
+      .order("created_at", { ascending: false });
+    return (data || []) as unknown as Course[];
+  }, () => mock.courses.filter((c) => c.creatorId === req.user!.id && c.status !== "archived"));
+  ok(res, list);
+});
+
+// ─── Admin: all courses across every status (catalog GET / is published-only) ──
+// Used by the admin "All Courses" table and the "review queue" (?status=under_review).
+app.get("/admin/courses", requireRole("admin"), async (req, res) => {
+  const status = typeof req.query.status === "string" ? req.query.status : undefined;
+  const list = await withDb(async (db) => {
+    let q = db.from("courses").select(COURSE_SUMMARY_COLS).order("created_at", { ascending: false });
+    if (status) q = q.eq("status", status);
+    const { data } = await q;
+    return (data || []) as unknown as Course[];
+  }, () => (status ? mock.courses.filter((c) => c.status === status) : mock.courses) as unknown as Course[]);
+  ok(res, list);
+});
+
+// ─── Aggregated course detail ────────────────────────────────────
+app.get("/:id/detail", async (req, res) => {
+  const id = req.params.id;
+  // Cache the public detail aggregate for 30s. It's the heaviest public read
+  // (course + modules + nodes + creator + reviews) and uncached it ran ~1s; under
+  // a browse spike, 500 concurrent hits on a popular course collapse to one DB
+  // read per 30s. Edits show within 30s — same eventual-consistency model as the
+  // catalog/search caches. withCache fails open (direct compute) if Redis is down.
+  // Loose generic: DB rows and the dev mock differ in nullability; the handler
+  // only null-checks and forwards the aggregate.
+  const aggregated = await withCache(`course:detail:${id}`, 30, () => withDb<{ course: unknown; creator: unknown; reviews: unknown } | null>(async (db) => {
+    const { data: course } = await db.from("courses").select("*").eq("id", id).maybeSingle();
+    if (!course) return null;
+    // Curriculum OUTLINE only — the public course page renders lesson titles/types/durations,
+    // not lesson bodies. Selecting explicit node columns (instead of nodes(*)) keeps heavy
+    // fields (markdown, static_website, video_url) and — critically — quiz answers
+    // (quiz_payload.correctIndex) out of this unauthenticated response. Full lesson content
+    // is served separately to the player via GET /:id.
+    const [{ data: modules }, { data: creator }, { data: reviews }] = await Promise.all([
+      db.from("modules").select("id, title, position, nodes(id, parent_node_id, type, title, position, duration_seconds, is_free_preview)").eq("course_id", course.id).order("position"),
+      db.from("profiles").select("user_id, display_name, username, bio, college, avatar_url").eq("user_id", course.creator_id).maybeSingle(),
+      db.from("reviews").select("id, rating, body, created_at, learner_id").eq("course_id", course.id).order("created_at", { ascending: false }).limit(10),
+    ]);
+    // Nested nodes come back unordered from PostgREST; sort the whole tree by
+    // position so the public curriculum matches the creator's saved order.
+    return { course: { ...course, modules: sortCourseTree(modules) }, creator, reviews };
+  }, () => {
+    const c = mock.courses.find((x) => x.id === id);
+    if (!c) return null;
+    const creator = mock.users.find((u) => u.id === c.creatorId);
+    return { course: c, creator, reviews: mock.reviews.filter((r) => r.courseId === c.id) };
+  }));
+  if (!aggregated) return fail(res, 404, "Course not found", "NOT_FOUND");
+  ok(res, aggregated);
+});
+
+// (The catch-all GET /:id course-fetch handler is registered at the bottom of
+//  this file — Express matches routes in registration order, so it must come
+//  after every literal GET path like /bookmarks, /lesson-bookmarks, /mine, etc.
+//  Otherwise those one-segment paths get swallowed by /:id and 404 as
+//  "Course not found".)
+
+// ─── Course CRUD (creator) ───────────────────────────────────────
+// Treat blank strings from the form as "not provided" so optional URL/uuid
+// fields don't fail .url() validation or hit the DB as empty strings.
+const blankToUndef = <T extends z.ZodTypeAny>(schema: T) =>
+  z.preprocess((v) => (v === "" || v === null ? undefined : v), schema);
+
+const CertificateTemplate = z.object({
+  heading: z.string().max(80).optional(),
+  body: z.string().max(120).optional(),
+  accentColor: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional(),
+  footerNote: z.string().max(120).optional(),
+}).strict().optional();
+
+// Field names are snake_case to match the frontend payload (Course/CourseNode types)
+// and the DB columns. (They were camelCase before, which silently dropped category_id,
+// thumbnail_url, video_url, static_website, quiz_payload, etc. on create.)
+const CourseCreate = z.object({
+  title: z.string().min(3).max(80),
+  subtitle: z.string().max(120).optional(),
+  description: z.string().optional(),
+  category_id: blankToUndef(z.string().optional()),
+  language: z.string().default("English"),
+  level: z.enum(["Beginner", "Intermediate", "Advanced", "All Levels"]).default("All Levels"),
+  tags: z.array(z.string()).max(10).default([]),
+  thumbnail_url: blankToUndef(z.string().url().optional()),
+  promo_video_url: blankToUndef(z.string().url().optional()),
+  price: z.number().int().min(0).default(0),
+  discounted_price: blankToUndef(z.number().int().min(0).optional()),
+  welcome_message: z.string().max(5000).optional(),
+  certificate_enabled: z.boolean().default(true),
+  certificate_min_progress: z.number().int().min(1).max(100).default(100),
+  certificate_require_quiz_pass: z.boolean().default(false),
+  certificate_template: CertificateTemplate,
+});
+
+app.post("/", requireRole("creator", "admin"), async (req, res) => {
+  const parsed = CourseCreate.safeParse(req.body);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message, "VALIDATION");
+  const d = parsed.data;
+  const result = await withDb(async (db) => {
+    const { data, error } = await db.from("courses").insert({
+      creator_id: req.user!.id,
+      title: d.title, subtitle: d.subtitle, description: d.description,
+      category_id: d.category_id, language: d.language, level: d.level, tags: d.tags,
+      thumbnail_url: d.thumbnail_url, promo_video_url: d.promo_video_url,
+      price: d.price, discounted_price: d.discounted_price,
+      welcome_message: d.welcome_message,
+      certificate_enabled: d.certificate_enabled,
+      certificate_min_progress: d.certificate_min_progress,
+      certificate_require_quiz_pass: d.certificate_require_quiz_pass,
+      certificate_template: d.certificate_template || {},
+      status: "draft",
+    }).select("*").single();
+    if (error) throw error;
+    // Auto-grant the creator the edit lock right after creation. The new-
+    // course flow's "save & republish" call writes the course + then its
+    // modules + lessons; the module/lesson writes go through the lock check,
+    // so without this the user would have to click "Take edit lock" before
+    // anything else can save. The lock is theirs until they release it or
+    // the 10-min idle TTL kicks in.
+    if (data?.id) {
+      try { await db.rpc("acquire_course_lock", { p_course_id: data.id, p_user_id: req.user!.id }); }
+      catch { /* best effort — the explicit Take Lock button is the fallback */ }
+    }
+    return data;
+  }, () => ({ id: `crs-${Date.now()}`, status: "draft", ...d }));
+  res.status(201);
+  ok(res, result);
+});
+
+// Delete a course — OWNER (or admin) only, and ONLY if nobody has purchased it.
+// A successful, non-refunded payment = a paying learner; deleting would strip
+// their access, so we block it (unpublish instead). Modules/lessons/enrollments/
+// reviews/bookmarks cascade; payments + razorpay_orders are ON DELETE RESTRICT,
+// so any lingering checkout record surfaces as a FK error we translate to a
+// clear message rather than a 500.
+app.delete("/:id", requireRole("creator", "admin"), async (req, res) => {
+  const courseId = String(req.params.id);
+  const result = await withDb<{ ok: true } | { error: { status: number; message: string; code: string } }>(async (db) => {
+    const role = await courseEditorRole(db, courseId, req.user!.id, req.user!.role === "admin");
+    if (!role) return { error: { status: 404, message: "Course not found", code: "NOT_FOUND" } };
+    if (role !== "owner" && req.user!.role !== "admin") {
+      return { error: { status: 403, message: "Only the course owner can delete it", code: "FORBIDDEN" } };
+    }
+    // The rule: block if anyone has purchased it.
+    const { count } = await db.from("payments")
+      .select("id", { count: "exact", head: true })
+      .eq("course_id", courseId).eq("status", "success");
+    if ((count || 0) > 0) {
+      return { error: { status: 409, code: "HAS_PURCHASERS",
+        message: `This course has ${count} purchase${count === 1 ? "" : "s"} — it can't be deleted (that would revoke paid learners' access). Unpublish it instead so no new learners can buy it.` } };
+    }
+    const [{ count: paymentRecordCount }, { count: orderRecordCount }] = await Promise.all([
+      db.from("payments").select("id", { count: "exact", head: true }).eq("course_id", courseId),
+      db.from("razorpay_orders").select("id", { count: "exact", head: true }).eq("course_id", courseId),
+    ]);
+    if ((paymentRecordCount || 0) > 0 || (orderRecordCount || 0) > 0) {
+      return { error: { status: 409, code: "HAS_PAYMENT_RECORDS",
+        message: "This course has payment/order records (e.g. abandoned or in-flight checkouts) on file and can't be deleted yet. Unpublish it, or contact support to clear those records." } };
+    }
+    await cleanupCourseStorage(db, courseId);
+    const { error } = await db.from("courses").delete().eq("id", courseId);
+    if (error) {
+      // 23503 = FK violation: a payment/order row (e.g. an abandoned or in-flight
+      // checkout) still references the course. Don't 500 — explain it.
+      if ((error as { code?: string }).code === "23503") {
+        return { error: { status: 409, code: "HAS_PAYMENT_RECORDS",
+          message: "This course has payment records (e.g. abandoned or in-flight checkouts) on file and can't be deleted yet. Unpublish it, or contact support to clear those records." } };
+      }
+      throw error;
+    }
+    return { ok: true };
+  }, () => ({ error: { status: 503, message: "Delete needs a configured database", code: "DB_REQUIRED" } }));
+  if ("error" in result) return fail(res, result.error.status, result.error.message, result.error.code);
+  ok(res, { deleted: true });
+});
+
+const CourseUpdate = CourseCreate.partial();
+app.patch("/:id", requireRole("creator", "admin"), async (req, res) => {
+  const parsed = CourseUpdate.safeParse(req.body);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message, "VALIDATION");
+  const p = parsed.data;
+
+  const result = await withDb(async (db) => {
+    const check = await assertCanWriteCourse(db, req.params.id, req.user!.id, req.user!.role === "admin");
+    if (!check.ok) return check;
+
+    // A PATCH is partial, so a stale discount left over from a higher price (or
+    // a premium→free switch) would violate the DB CHECK `discounted_price <
+    // price` even when the caller only changed `price` — and withDb would
+    // swallow it and misreport "Course not found". resolveCoursePricing merges
+    // the patch onto the current row and keeps the pair valid (or rejects an
+    // explicitly invalid one with a clear message).
+    const { data: existing } = await db.from("courses").select("price, discounted_price").eq("id", req.params.id).maybeSingle();
+    if (!existing) return { notFound: true } as const;
+    const pricing = resolveCoursePricing(
+      { price: p.price, discounted_price: p.discounted_price },
+      { price: existing.price as number, discounted_price: existing.discounted_price as number | null },
+    );
+    if (!pricing.ok) return { ok: false as const, status: 400, code: "VALIDATION", message: pricing.error };
+
+    const { data, error } = await db.from("courses").update({
+      title: p.title, subtitle: p.subtitle, description: p.description,
+      category_id: p.category_id, language: p.language, level: p.level, tags: p.tags,
+      thumbnail_url: p.thumbnail_url, promo_video_url: p.promo_video_url,
+      price: pricing.price, discounted_price: pricing.discounted_price,
+      welcome_message: p.welcome_message,
+      certificate_enabled: p.certificate_enabled,
+      certificate_min_progress: p.certificate_min_progress,
+      certificate_require_quiz_pass: p.certificate_require_quiz_pass,
+      certificate_template: p.certificate_template,
+    }).eq("id", req.params.id).select("*").maybeSingle();
+    if (error) throw error;
+    return data;
+  }, null);
+  if (!result) return fail(res, 404, "Course not found", "NOT_FOUND");
+  if ("ok" in result && result.ok === false) return fail(res, result.status, result.message, result.code, result.meta);
+  if ("notFound" in result) return fail(res, 404, "Course not found", "NOT_FOUND");
+  ok(res, result);
+});
+
+// Creator T&C gate: submitting/publishing a course requires the CURRENT terms
+// version (platform_settings.creator_terms_version) to be accepted by the
+// acting user. Admins bypass. Returns a structured error the frontend uses to
+// open the acceptance modal and retry the original action.
+async function creatorTermsCheck(db: SupabaseClient, userId: string, isAdmin: boolean): Promise<WriteCheck | null> {
+  if (isAdmin) return null;
+  const currentVersion = String(await getPlatformSetting("creator_terms_version", "2026-05-01"));
+  const { data: acceptance } = await db.from("creator_terms_acceptance")
+    .select("terms_version")
+    .eq("creator_id", userId)
+    .eq("terms_version", currentVersion)
+    .maybeSingle();
+  if (acceptance) return null;
+  const { data: latest } = await db.from("creator_terms_acceptance")
+    .select("terms_version").eq("creator_id", userId)
+    .order("accepted_at", { ascending: false }).limit(1).maybeSingle();
+  return {
+    ok: false, status: 403, code: "TERMS_ACCEPTANCE_REQUIRED",
+    message: "Accept the current creator terms before submitting this course",
+    meta: { currentVersion, acceptedVersion: latest?.terms_version || null, termsHref: "/creator/finance" },
+  };
+}
+
+app.post("/:id/submit-review", requireRole("creator"), async (req, res) => {
+  const result = await withDb(async (db) => {
+    const terms = await creatorTermsCheck(db, req.user!.id, req.user!.role === "admin");
+    if (terms) return terms;
+    const check = await assertCanWriteCourse(db, req.params.id, req.user!.id, req.user!.role === "admin");
+    if (!check.ok) return check;
+    const { data, error } = await db.from("courses").update({ status: "under_review" }).eq("id", req.params.id).select("id, status").maybeSingle();
+    if (error) throw error;
+    return data;
+  }, () => ({ id: req.params.id, status: "under_review" as const }));
+  if (!result) return fail(res, 404, "Course not found or not yours", "NOT_FOUND");
+  if ("ok" in result && result.ok === false) return fail(res, result.status, result.message, result.code, result.meta);
+  ok(res, result);
+});
+
+// Notify the right audience when a course goes live, branching on whether the
+// course was ever published before:
+//   • First publish   → tell the creator's FOLLOWERS a new course is out
+//                        ("new_course", from the subscriptions table).
+//   • Re-publish (edit)→ tell everyone ENROLLED the course was UPDATED
+//                        ("course_updated", from the enrollments table) — and
+//                        deliberately NOT "new_course".
+// Realtime broadcast is intentionally skipped (bell polling covers it) to avoid
+// a per-recipient fan-out loop. `wasPublishedBefore` is derived from the course's
+// pre-update published_at (stamped only on the first publish — see 0013 trigger).
+async function notifyOnPublish(courseId: string, creatorId: string | undefined, wasPublishedBefore: boolean): Promise<void> {
+  if (!creatorId) return;
+  await withDb(async (db) => {
+    const { data: course } = await db.from("courses").select("title").eq("id", courseId).maybeSingle();
+    if (!course) return null;
+
+    if (wasPublishedBefore) {
+      // Skip if we already told learners about an update to this course in the
+      // last 6h, so rapid edit→republish cycles don't spam the same people.
+      const sinceIso = new Date(Date.now() - 6 * 60 * 60 * 1000).toISOString();
+      const { data: recent } = await db.from("notifications")
+        .select("id").eq("type", "course_updated").eq("href", `/course/${courseId}`)
+        .gte("created_at", sinceIso).limit(1).maybeSingle();
+      if (recent) return null;
+      const { data: enrolled } = await db.from("enrollments")
+        .select("learner_id").eq("course_id", courseId).limit(2000);
+      if (!enrolled || enrolled.length === 0) return null;
+      await db.from("notifications").insert(enrolled.map((e) => ({
+        user_id: e.learner_id,
+        type: "course_updated",
+        title: "A course you're enrolled in was updated",
+        body: course.title,
+        href: `/course/${courseId}`,
+      })));
+      return null;
+    }
+
+    // First publish — announce the new course to followers (one-time sentinel
+    // guards against a duplicate insert if this path runs twice).
+    const { data: already } = await db.from("notifications")
+      .select("id").eq("type", "new_course").eq("href", `/course/${courseId}`).limit(1).maybeSingle();
+    if (already) return null;
+    const [{ data: creatorProfile }, { data: subs }] = await Promise.all([
+      db.from("profiles").select("display_name").eq("user_id", creatorId).maybeSingle(),
+      db.from("subscriptions").select("learner_id").eq("creator_id", creatorId).limit(500),
+    ]);
+    if (!subs || subs.length === 0) return null;
+    await db.from("notifications").insert(subs.map((s) => ({
+      user_id: s.learner_id,
+      type: "new_course",
+      title: `New course from ${creatorProfile?.display_name || "a creator you follow"}`,
+      body: course.title,
+      href: `/course/${courseId}`,
+    })));
+    return null;
+  }, null);
+}
+
+// Creator-initiated direct publish. Requires the course to be theirs, with at
+// least one module and one lesson — otherwise the catalog would show an empty
+// course. published_at is stamped by the trg_courses_published_at trigger.
+app.post("/:id/publish", requireRole("creator"), async (req, res) => {
+  // Captured inside the closure, read after — a non-null published_at means this
+  // course has gone live before, so it's an edit→re-publish, not a brand-new
+  // course (the 0013 trigger only stamps published_at on the first publish).
+  let wasPublishedBefore = false;
+  const result = await withDb(async (db) => {
+    const terms = await creatorTermsCheck(db, req.user!.id, req.user!.role === "admin");
+    if (terms) return terms;
+    const check = await assertCanWriteCourse(db, req.params.id, req.user!.id, req.user!.role === "admin");
+    if (!check.ok) return check;
+    const { data: course } = await db.from("courses").select("id, creator_id, title, published_at").eq("id", req.params.id).maybeSingle();
+    if (!course) return { notFound: true } as const;
+    if (!course.title || course.title.trim().length < 3) return { invalid: "Course title needs at least 3 characters" } as const;
+    wasPublishedBefore = course.published_at != null;
+    const { count: lessonCount } = await db
+      .from("nodes")
+      .select("id, modules!inner(course_id)", { count: "exact", head: true })
+      .eq("modules.course_id", req.params.id)
+      .neq("type", "folder");
+    if (!lessonCount || lessonCount < 1) {
+      return { invalid: "Add at least one lesson before publishing" } as const;
+    }
+    const storageError = publishStorageQuotaError(await getCreatorStorage(db, course.creator_id));
+    if (storageError) return storageError;
+    const { data, error } = await db.from("courses").update({ status: "published" }).eq("id", req.params.id).select("id, status, published_at").maybeSingle();
+    if (error) throw error;
+    if (data) await refreshCatalogSnapshot(db);
+    return data;
+  }, () => ({ id: req.params.id, status: "published" as const, published_at: new Date().toISOString() }));
+  if (!result) return fail(res, 404, "Not found", "NOT_FOUND");
+  if ("ok" in result && result.ok === false) return fail(res, result.status, result.message, result.code, result.meta);
+  if ("notFound" in result) return fail(res, 404, "Course not found", "NOT_FOUND");
+  if ("invalid" in result) return fail(res, 400, result.invalid ?? "Invalid request", "VALIDATION");
+  if ("quotaExceeded" in result) {
+    return fail(
+      res,
+      402,
+      `You're over your storage quota. Buy more storage before publishing this course.`,
+      "QUOTA_EXCEEDED",
+      { used: result.used, quota: result.quota, needed: result.needed, priceInrPerMb: result.priceInrPerMb },
+    );
+  }
+  await publish(Topics.COURSE_PUBLISHED, { courseId: (result as { id: string }).id, creatorId: req.user!.id });
+  await notifyOnPublish((result as { id: string }).id, req.user!.id, wasPublishedBefore);
+  ok(res, result);
+});
+
+app.post("/:id/approve", requireRole("admin"), async (req, res) => {
+  // Was it ever live before? Only stamp published_at on the first approval so
+  // re-approving an edited course preserves the original "since when" date.
+  let wasPublishedBefore = false;
+  const result = await withDb(async (db) => {
+    const { data: prior } = await db.from("courses").select("published_at").eq("id", req.params.id).maybeSingle();
+    wasPublishedBefore = prior?.published_at != null;
+    const patch: Record<string, unknown> = { status: "published" };
+    if (!wasPublishedBefore) patch.published_at = new Date().toISOString();
+    const { data, error } = await db.from("courses").update(patch).eq("id", req.params.id).select("id, status, creator_id, title").maybeSingle();
+    if (error) throw error;
+    if (data) {
+      await db.from("admin_audit_log").insert({ admin_id: req.user!.id, action: "course.approve", target_type: "course", target_id: data.id });
+      await refreshCatalogSnapshot(db);
+    }
+    return data;
+  }, () => ({ id: req.params.id, status: "published" as const, creator_id: "u2", title: "" }));
+  if (!result) return fail(res, 404, "Not found", "NOT_FOUND");
+  await publish(Topics.COURSE_PUBLISHED, { courseId: result.id, creatorId: (result as { creator_id?: string }).creator_id });
+  await notifyOnPublish(result.id, (result as { creator_id?: string }).creator_id, wasPublishedBefore);
+  ok(res, result);
+});
+
+app.post("/:id/reject", requireRole("admin"), async (req, res) => {
+  const reason = String(req.body.reason || "");
+  if (reason.length < 20) return fail(res, 400, "Reason must be at least 20 characters", "VALIDATION");
+  const result = await withDb(async (db) => {
+    const { data } = await db.from("courses").update({ status: "draft" }).eq("id", req.params.id).select("id, creator_id").maybeSingle();
+    if (data) {
+      await db.from("admin_audit_log").insert({ admin_id: req.user!.id, action: "course.reject", target_type: "course", target_id: data.id, metadata: { reason } });
+      // Reject removes the course from the published catalog snapshot.
+      await refreshCatalogSnapshot(db);
+    }
+    return data;
+  }, null);
+  if (!result) return fail(res, 404, "Not found", "NOT_FOUND");
+  ok(res, { id: result.id, status: "draft", reason });
+});
+
+// ─── Modules ──────────────────────────────────────────────────────
+app.post("/:id/modules", requireRole("creator", "admin"), async (req, res) => {
+  const title = String(req.body.title || "");
+  if (!title) return fail(res, 400, "Title required", "VALIDATION");
+  const result = await withDb(async (db) => {
+    const check = await assertCanWriteCourse(db, req.params.id, req.user!.id, req.user!.role === "admin");
+    if (!check.ok) return check;
+    const { count } = await db.from("modules").select("id", { count: "exact", head: true }).eq("course_id", req.params.id);
+    const { data } = await db.from("modules").insert({ course_id: req.params.id, title, position: count || 0 }).select("*").single();
+    return data;
+  }, () => ({ id: `m-${Date.now()}`, course_id: req.params.id, title, position: 0 }));
+  if (result && "ok" in result && result.ok === false) return fail(res, result.status, result.message, result.code, result.meta);
+  ok(res, result);
+});
+
+app.patch("/modules/:id", requireRole("creator", "admin"), async (req, res) => {
+  const result = await withDb(async (db) => {
+    const courseId = await moduleCourseId(db, req.params.id);
+    if (!courseId) return { notFound: true } as const;
+    const check = await assertCanWriteCourse(db, courseId, req.user!.id, req.user!.role === "admin");
+    if (!check.ok) return check;
+    const { data } = await db.from("modules").update({ title: req.body.title, position: req.body.position }).eq("id", req.params.id).select("*").maybeSingle();
+    return data;
+  }, null);
+  if (result && "ok" in result && result.ok === false) return fail(res, result.status, result.message, result.code, result.meta);
+  if (result && "notFound" in result) return fail(res, 404, "Module not found", "NOT_FOUND");
+  ok(res, result);
+});
+
+app.delete("/modules/:id", requireRole("creator", "admin"), async (req, res) => {
+  const result = await withDb<{ notFound: true } | { deleted: true } | WriteCheck>(async (db) => {
+    const courseId = await moduleCourseId(db, req.params.id);
+    if (!courseId) return { notFound: true } as const;
+    const check = await assertCanWriteCourse(db, courseId, req.user!.id, req.user!.role === "admin");
+    if (!check.ok) return check;
+    await db.from("modules").delete().eq("id", req.params.id);
+    return { deleted: true } as const;
+  }, () => ({ deleted: true } as const));
+  if ("ok" in result && result.ok === false) return fail(res, result.status, result.message, result.code, result.meta);
+  if ("notFound" in result) return fail(res, 404, "Module not found", "NOT_FOUND");
+  ok(res, { deleted: true });
+});
+
+// ─── Nodes ────────────────────────────────────────────────────────
+// snake_case to match the frontend payload + DB columns (was camelCase, which dropped
+// duration_seconds / is_free_preview / video_url / pdf_url / static_website / quiz_payload).
+const NodeCreate = z.object({
+  moduleId: z.string(),
+  parent_node_id: z.string().uuid().nullable().optional(),
+  type: z.enum(["video", "markdown", "quiz", "pdf", "static_website", "folder"]),
+  title: z.string().min(1).max(100),
+  duration_seconds: z.number().int().optional(),
+  is_free_preview: z.boolean().optional().default(false),
+  video_url: blankToUndef(z.string().url().optional()),
+  video_provider: z.enum(["youtube", "gdrive"]).optional(),
+  video_chapters: VideoChapters.optional(),
+  video_subtitles: VideoSubtitles.optional(),
+  markdown: z.string().optional(),
+  // PDFs are now stored as Supabase Storage paths (e.g. "<uuid>/<file>.pdf"),
+  // not URLs. Keep this loose so both new paths and legacy full URLs pass.
+  pdf_url: blankToUndef(z.string().max(500).optional()),
+  static_website: z.object({ html: z.string(), css: z.string(), js: z.string() }).optional(),
+  quiz_payload: z.object({
+    timerSeconds: z.number().int().optional(),
+    passingPercent: z.number().int().optional(),
+    questions: z.array(z.object({
+      id: z.string(), prompt: z.string(),
+      options: z.array(z.string()).length(4),
+      correctIndex: z.number().int().min(0).max(3),
+      explanation: z.string().optional(),
+    })),
+  }).optional(),
+});
+
+app.post("/nodes", requireRole("creator", "admin"), async (req, res) => {
+  const parsed = NodeCreate.safeParse(req.body);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message, "VALIDATION");
+  const d = parsed.data;
+  const result = await withDb(async (db) => {
+    const courseId = await moduleCourseId(db, d.moduleId);
+    if (!courseId) return { notFound: true } as const;
+    const check = await assertCanWriteCourse(db, courseId, req.user!.id, req.user!.role === "admin");
+    if (!check.ok) return check;
+    if (d.parent_node_id) {
+      const { data: parent } = await db.from("nodes").select("id, module_id, type").eq("id", d.parent_node_id).maybeSingle();
+      if (!parent) return { parentNotFound: true } as const;
+      if (parent.module_id !== d.moduleId) return { parentModuleMismatch: true } as const;
+      if (parent.type !== "folder") return { parentNotFolder: true } as const;
+    }
+    if (d.type === "static_website") {
+      const { data: course } = await db.from("courses").select("creator_id").eq("id", courseId).maybeSingle();
+      if (course?.creator_id) {
+        const state = await getCreatorStorage(db, course.creator_id);
+        const quotaError = storageQuotaDeltaError(state, staticWebsitePayloadBytes(d.static_website));
+        if (quotaError) return quotaError;
+      }
+    }
+    let positionQuery = db.from("nodes").select("id", { count: "exact", head: true }).eq("module_id", d.moduleId);
+    positionQuery = d.parent_node_id ? positionQuery.eq("parent_node_id", d.parent_node_id) : positionQuery.is("parent_node_id", null);
+    const { count } = await positionQuery;
+    const { data, error } = await db.from("nodes").insert({
+      module_id: d.moduleId, parent_node_id: d.parent_node_id || null, type: d.type, title: d.title, position: count || 0,
+      duration_seconds: d.duration_seconds, is_free_preview: d.is_free_preview,
+      video_url: d.video_url, video_provider: d.video_provider,
+      video_chapters: d.video_chapters, video_subtitles: d.video_subtitles,
+      markdown: d.markdown, pdf_url: d.pdf_url,
+      static_website: d.static_website, quiz_payload: d.quiz_payload,
+    }).select("*").single();
+    if (error) throw error;
+    if (data.type === "pdf") {
+      const path = pdfStoragePath(data.pdf_url);
+      if (path) {
+        await db.from("uploaded_assets")
+          .update({ entity_type: "lesson_pdf", entity_id: data.id })
+          .eq("bucket", PDF_BUCKET)
+          .eq("path", path);
+      }
+    }
+    return data;
+  }, () => ({ id: `n-${Date.now()}`, ...d }));
+  if (result && "ok" in result && result.ok === false) return fail(res, result.status, result.message, result.code, result.meta);
+  if (result && "notFound" in result) return fail(res, 404, "Module not found", "NOT_FOUND");
+  if (result && "parentNotFound" in result) return fail(res, 404, "Parent folder not found", "PARENT_NOT_FOUND");
+  if (result && "parentModuleMismatch" in result) return fail(res, 400, "Parent folder must be in the same module", "PARENT_MODULE_MISMATCH");
+  if (result && "parentNotFolder" in result) return fail(res, 400, "Parent node must be a folder", "PARENT_NOT_FOLDER");
+  if (result && "overQuota" in result) {
+    return fail(res, 402, "You're over your storage quota. Buy more storage before saving or publishing this course.", "QUOTA_EXCEEDED", result);
+  }
+  await publish(Topics.COURSE_NODE_ADDED, { nodeId: (result as { id: string }).id, moduleId: d.moduleId });
+  ok(res, result);
+});
+
+app.patch("/nodes/:id", requireRole("creator", "admin"), async (req, res) => {
+  // Lesson type is chosen at creation and locked thereafter — strip any attempt
+  // to change it (or move the lesson to a different module). The UI doesn't
+  // expose either, but a hand-crafted request must not be able to either.
+  const { type: _t, module_id: _m, parent_node_id: _p, id: _i, ...patch } = req.body || {};
+  void _t; void _m; void _p; void _i;
+  // Structured video extras (chapters/subtitles) must be well-formed; the rest
+  // of the patch is plain column updates covered by DB constraints.
+  const extras = NodeVideoExtras.safeParse(patch);
+  if (!extras.success) return fail(res, 400, extras.error.issues[0].message, "VALIDATION");
+  const result = await withDb(async (db) => {
+    const courseId = await nodeCourseId(db, req.params.id);
+    if (!courseId) return { notFound: true } as const;
+    const check = await assertCanWriteCourse(db, courseId, req.user!.id, req.user!.role === "admin");
+    if (!check.ok) return check;
+    if (Object.prototype.hasOwnProperty.call(patch, "static_website")) {
+      const [{ data: course }, { data: existing }] = await Promise.all([
+        db.from("courses").select("creator_id").eq("id", courseId).maybeSingle(),
+        db.from("nodes").select("type, static_website").eq("id", req.params.id).maybeSingle(),
+      ]);
+      if (course?.creator_id && existing?.type === "static_website") {
+        const oldBytes = staticWebsitePayloadBytes(existing.static_website);
+        const newBytes = staticWebsitePayloadBytes(patch.static_website);
+        const state = await getCreatorStorage(db, course.creator_id);
+        const quotaError = storageQuotaDeltaError(state, newBytes - oldBytes);
+        if (quotaError) return quotaError;
+      }
+    }
+    const { data } = await db.from("nodes").update(patch).eq("id", req.params.id).select("*").maybeSingle();
+    return data;
+  }, null);
+  if (result && "ok" in result && result.ok === false) return fail(res, result.status, result.message, result.code, result.meta);
+  if (result && "notFound" in result) return fail(res, 404, "Lesson not found", "NOT_FOUND");
+  if (result && "overQuota" in result) {
+    return fail(res, 402, "You're over your storage quota. Buy more storage before saving or publishing this course.", "QUOTA_EXCEEDED", result);
+  }
+  ok(res, result);
+});
+
+app.delete("/nodes/:id", requireRole("creator", "admin"), async (req, res) => {
+  const result = await withDb<{ notFound: true } | { deleted: true } | WriteCheck>(async (db) => {
+    const courseId = await nodeCourseId(db, req.params.id);
+    if (!courseId) return { notFound: true } as const;
+    const check = await assertCanWriteCourse(db, courseId, req.user!.id, req.user!.role === "admin");
+    if (!check.ok) return check;
+    await db.from("nodes").delete().eq("id", req.params.id);
+    return { deleted: true } as const;
+  }, () => ({ deleted: true } as const));
+  if ("ok" in result && result.ok === false) return fail(res, result.status, result.message, result.code, result.meta);
+  if ("notFound" in result) return fail(res, 404, "Lesson not found", "NOT_FOUND");
+  ok(res, { deleted: true });
+});
+
+// PDF lesson upload — hand the client a one-time signed URL so the file streams
+// straight from the browser to Supabase Storage. The course-service never sees
+// the file bytes. Bucket is PRIVATE — viewing happens via a separate
+// /pdf-view-url endpoint that gates on enrollment.
+// Extract a storage-relative path from whatever's stored in nodes.pdf_url. Old
+// rows still have the full public CDN URL; new uploads store just the path.
+function pdfStoragePath(stored: string | null | undefined): string | null {
+  if (!stored) return null;
+  const marker = "/node-pdfs/";
+  const idx = stored.indexOf(marker);
+  if (idx >= 0) return stored.slice(idx + marker.length);
+  // Already a bare path like "<uuid>/<file>.pdf"
+  return stored.replace(/^\/+/, "");
+}
+
+// Lets a creator preview a PDF they just uploaded, before the lesson has been
+// saved to the DB. The path must live under their own creator-id prefix —
+// enforced by the upload endpoint that mints these paths.
+app.post("/uploads/pdf-view-url", requireRole("creator", "admin"), async (req, res) => {
+  const raw = String(req.body?.path || "");
+  const path = pdfStoragePath(raw);
+  if (!path || (!path.startsWith(`${req.user!.id}/`) && req.user!.role !== "admin")) {
+    return fail(res, 403, "Cannot sign this path", "FORBIDDEN");
+  }
+  const result = await withDb(async (db) => {
+    const { data, error } = await db.storage.from(PDF_BUCKET).createSignedUrl(path, 60 * 60);
+    if (error) throw error;
+    return { signedUrl: data.signedUrl };
+  }, null);
+  if (!result) return fail(res, 503, "Storage not configured", "STORAGE_OFFLINE");
+  ok(res, result);
+});
+
+app.post("/uploads/pdf-url", requireRole("creator", "admin"), async (req, res) => {
+  const filename = String(req.body?.filename || "");
+  if (!filename.toLowerCase().endsWith(".pdf")) {
+    return fail(res, 400, "Only PDF files allowed", "VALIDATION");
+  }
+  const size = Number(req.body?.sizeBytes || 0);
+  if (size <= 0 || size > PDF_MAX_BYTES) {
+    return fail(res, 400, "PDF too large (max 25MB)", "VALIDATION");
+  }
+  const path = `${req.user!.id}/${randomUUID()}.pdf`;
+  const result = await withDb(async (db) => {
+    // Atomic reserve. The RPC takes a row-level lock on creator_storage,
+    // checks (bytes_used + pending_bytes + requested) against the cap,
+    // and bumps pending_bytes if it fits — so two concurrent uploads
+    // CAN'T both pass the check on a stale read. The pending reservation
+    // is drained by the storage.objects trigger when the upload lands.
+    const { data: reservation, error: reserveError } = await db.rpc("reserve_storage", {
+      p_creator_id: req.user!.id,
+      p_bytes: size,
+      p_free_mb: STORAGE_FREE_MB,
+    });
+    if (reserveError) throw reserveError;
+    const r = Array.isArray(reservation) ? reservation[0] : reservation;
+    if (!r?.ok) {
+      return {
+        overQuota: true,
+        used: Number(r?.bytes_used ?? 0),
+        quota: Number(r?.quota_bytes ?? STORAGE_FREE_MB * BYTES_PER_MB),
+        needed: size,
+        priceInrPerMb: STORAGE_PRICE_PER_MB_INR,
+      } as const;
+    }
+
+    const { data, error } = await db.storage.from(PDF_BUCKET).createSignedUploadUrl(path);
+    if (error) throw error;
+    return { signedUrl: data.signedUrl, token: data.token, path } as const;
+  }, null);
+  if (!result) return fail(res, 503, "Storage not configured", "STORAGE_OFFLINE");
+  if ("overQuota" in result) {
+    return fail(
+      res, 402,
+      `You're over your storage quota. Free up space or buy more MB at ₹${STORAGE_PRICE_PER_MB_INR}/MB.`,
+      "QUOTA_EXCEEDED",
+      { used: result.used, quota: result.quota, needed: result.needed, priceInrPerMb: result.priceInrPerMb },
+    );
+  }
+  ok(res, result);
+});
+
+// Confirm a completed PDF upload so its bytes count toward the creator's storage
+// quota. The browser streams the file straight to Supabase Storage via the signed
+// URL, so the bytes never reach us — the client reports the size here and we commit
+// it (and drain the reservation made in /uploads/pdf-url). This is the authoritative
+// accounting; the storage.objects trigger is a no-op (see migration 0035).
+app.post("/uploads/pdf-confirm", requireRole("creator", "admin"), async (req, res) => {
+  const path = String(req.body?.path || "");
+  const size = Number(req.body?.sizeBytes || 0);
+  if (!path || (!path.startsWith(`${req.user!.id}/`) && req.user!.role !== "admin")) {
+    return fail(res, 403, "Cannot confirm this path", "FORBIDDEN");
+  }
+  if (size <= 0 || size > PDF_MAX_BYTES) {
+    return fail(res, 400, "Invalid file size", "VALIDATION");
+  }
+  // Bill the file's owner — the path prefix — matching the "<creatorId>/<uuid>.pdf"
+  // convention that /uploads/pdf-url mints.
+  const creatorId = path.split("/")[0];
+  const result = await withDb(async (db) => {
+    const { error } = await db.rpc("commit_storage", { p_creator_id: creatorId, p_bytes: size });
+    if (error) throw error;
+    await db.from("uploaded_assets").upsert({
+      owner_id: creatorId,
+      bucket: PDF_BUCKET,
+      path,
+      original_filename: path.split("/").pop() || "lesson.pdf",
+      mime_type: "application/pdf",
+      size_bytes: size,
+      entity_type: "lesson_pdf",
+      entity_id: null,
+    }, { onConflict: "bucket,path" });
+    return { committed: true } as const;
+  }, null);
+  if (!result) return fail(res, 503, "Storage not configured", "STORAGE_OFFLINE");
+  ok(res, result);
+});
+
+// Signed read URL for a PDF lesson. Gated by enrollment (or ownership/admin).
+// Short TTL so a copied link rots within an hour; combined with the canvas
+// renderer + disabled save UI on the frontend, this raises the bar a lot.
+app.get("/nodes/:nodeId/pdf-view-url", requireAuth, async (req, res) => {
+  const result = await withDb(async (db) => {
+    const { data: node } = await db.from("nodes")
+      .select("type, pdf_url, modules!inner(course_id, courses!inner(creator_id))")
+      .eq("id", req.params.nodeId)
+      .maybeSingle();
+    if (!node) return { notFound: true } as const;
+    if (node.type !== "pdf" || !node.pdf_url) return { invalid: true } as const;
+    const path = pdfStoragePath(node.pdf_url);
+    if (!path) return { invalid: true } as const;
+    // Flatten the nested relations and check entitlement.
+    type Rel = { course_id: string; courses: { creator_id: string } | { creator_id: string }[] };
+    const one = <T,>(v: T | T[] | null | undefined): T | undefined => (Array.isArray(v) ? v[0] : v ?? undefined);
+    const mod = one(node.modules) as Rel | undefined;
+    const courseId = mod?.course_id;
+    const creatorId = (one(mod?.courses) as { creator_id: string } | undefined)?.creator_id;
+    if (!courseId || !creatorId) return { invalid: true } as const;
+    const isOwner = req.user!.id === creatorId || req.user!.role === "admin";
+    if (!isOwner) {
+      const { data: enr } = await db.from("enrollments")
+        .select("id, access_expires_at").eq("learner_id", req.user!.id).eq("course_id", courseId).maybeSingle();
+      const expiresAt = (enr as { access_expires_at?: string | null } | null)?.access_expires_at ?? null;
+      const active = !!enr && (expiresAt === null || new Date(expiresAt).getTime() > Date.now());
+      if (!active) return { forbidden: true } as const;
+    }
+    const { data, error } = await db.storage.from(PDF_BUCKET).createSignedUrl(path, PDF_VIEW_TTL_SECONDS);
+    if (error || !data) return null;
+    return { signedUrl: data.signedUrl, expiresIn: PDF_VIEW_TTL_SECONDS } as const;
+  }, null);
+  if (!result) return fail(res, 503, "Storage not configured", "STORAGE_OFFLINE");
+  if ("notFound" in result) return fail(res, 404, "Lesson not found", "NOT_FOUND");
+  if ("invalid" in result) return fail(res, 400, "Lesson has no PDF attached", "VALIDATION");
+  if ("forbidden" in result) return fail(res, 403, "Enroll to view this PDF", "FORBIDDEN");
+  ok(res, result);
+});
+
+registerReviewRoutes(app);
+
+// ─── Comments / doubts ───────────────────────────────────────────
+// PostgREST can't go comments→profiles directly (comments.author_id FKs users,
+// not profiles), but it CAN traverse comments→users→profiles. We flatten back
+// to `comment.profiles` so the frontend shape stays the same.
+type CommentRow = {
+  id: string; node_id: string; author_id: string; parent_id: string | null;
+  body: string; upvotes: number; is_resolved: boolean; kind: "comment" | "doubt"; created_at: string;
+  reply_count?: number;
+  users?: { profiles?: { display_name?: string; username?: string; avatar_url?: string } | null } | null;
+  profiles?: { display_name?: string; username?: string; avatar_url?: string } | null;
+};
+function flattenProfiles(rows: CommentRow[] | null | undefined): CommentRow[] {
+  return (rows || []).map((r) => {
+    const p = r.users?.profiles || null;
+    const out = { ...r, profiles: p } as CommentRow;
+    delete out.users;
+    return out;
+  });
+}
+
+// Paginated top-level feed. Replies are NOT embedded — clients fetch them via
+// /comments/:id/replies when a thread is expanded. Backed by partial index
+// idx_comments_node_top (node_id, kind, created_at desc) where parent_id is null
+// — designed so a single popular lesson can have hundreds of thousands of
+// comments without the feed slowing down.
+app.get("/nodes/:nodeId/comments", async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 20, 1), 100);
+  const offset = Math.max(Number(req.query.offset) || 0, 0);
+  const filter = req.query.filter === "doubt" || req.query.filter === "comment" ? req.query.filter : null;
+  const result = await withDb(async (db) => {
+    let q = db.from("comments")
+      .select("*, users!comments_author_id_fkey(profiles(display_name, username, avatar_url))", { count: "exact" })
+      .eq("node_id", req.params.nodeId)
+      .is("parent_id", null);
+    if (filter) q = q.eq("kind", filter);
+    const { data, count } = await q
+      .order("created_at", { ascending: false })
+      .range(offset, offset + limit - 1);
+    const items = flattenProfiles(data as CommentRow[] | null);
+    const total = count || 0;
+    return { items, total, hasMore: offset + items.length < total };
+  }, () => ({ items: [], total: 0, hasMore: false }));
+  ok(res, result);
+});
+
+// Paginated replies for one parent comment. Chronological — supports
+// idx_comments_parent_created (parent_id, created_at). Bounded payload so
+// a single thread with 10k replies still serves cheaply per page.
+app.get("/comments/:id/replies", async (req, res) => {
+  const limit = Math.min(Math.max(Number(req.query.limit) || 50, 1), 200);
+  const offset = Math.max(Number(req.query.offset) || 0, 0);
+  const result = await withDb(async (db) => {
+    const { data, count } = await db.from("comments")
+      .select("*, users!comments_author_id_fkey(profiles(display_name, username, avatar_url))", { count: "exact" })
+      .eq("parent_id", req.params.id)
+      .order("created_at", { ascending: true })
+      .range(offset, offset + limit - 1);
+    const items = flattenProfiles(data as CommentRow[] | null);
+    const total = count || 0;
+    return { items, total, hasMore: offset + items.length < total };
+  }, () => ({ items: [], total: 0, hasMore: false }));
+  ok(res, result);
+});
+
+// Creator-only Doubts Inbox: every doubt across courses the caller owns, with
+// course/status/search/date filters and pagination. Single read with nested
+// embeds — no N+1; counts come from two cheap head-only queries.
+app.get("/doubts/inbox", requireRole("creator", "admin"), async (req, res) => {
+  const page = Math.max(1, Number(req.query.page || 1));
+  const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize || 20)));
+  const courseId = typeof req.query.courseId === "string" && req.query.courseId ? req.query.courseId : null;
+  const status = req.query.status === "open" || req.query.status === "resolved" ? req.query.status : null;
+  const search = typeof req.query.q === "string" && req.query.q.trim() ? req.query.q.trim() : null;
+  const dateFrom = typeof req.query.dateFrom === "string" && req.query.dateFrom ? req.query.dateFrom : null;
+  const dateToRaw = typeof req.query.dateTo === "string" && req.query.dateTo ? req.query.dateTo : null;
+  const dateTo = dateToRaw && dateToRaw.length === 10 ? `${dateToRaw}T23:59:59.999Z` : dateToRaw;
+
+  const result = await withDb(async (db) => {
+    const base = () => {
+      let q = db.from("comments")
+        .select("id, nodes!inner(modules!inner(courses!inner(id, creator_id)))", { count: "exact", head: true })
+        .eq("kind", "doubt").is("parent_id", null)
+        .eq("nodes.modules.courses.creator_id", req.user!.id);
+      if (courseId) q = q.eq("nodes.modules.courses.id", courseId);
+      return q;
+    };
+    let listQuery = db.from("comments")
+      .select(`
+        id, body, kind, is_resolved, created_at, node_id, author_id,
+        users!comments_author_id_fkey(profiles(display_name, username, avatar_url)),
+        nodes!inner(id, title, modules!inner(id, courses!inner(id, title, creator_id)))
+      `, { count: "exact" })
+      .eq("kind", "doubt")
+      .is("parent_id", null)
+      .eq("nodes.modules.courses.creator_id", req.user!.id);
+    if (courseId) listQuery = listQuery.eq("nodes.modules.courses.id", courseId);
+    if (status) listQuery = listQuery.eq("is_resolved", status === "resolved");
+    if (search) listQuery = listQuery.ilike("body", `%${search}%`);
+    if (dateFrom) listQuery = listQuery.gte("created_at", dateFrom);
+    if (dateTo) listQuery = listQuery.lte("created_at", dateTo);
+
+    const [{ data, count }, openRes, resolvedRes] = await Promise.all([
+      listQuery
+        .order("is_resolved", { ascending: true })
+        .order("created_at", { ascending: false })
+        .range((page - 1) * pageSize, page * pageSize - 1),
+      base().eq("is_resolved", false),
+      base().eq("is_resolved", true),
+    ]);
+
+    // Flatten author profile and course/node fields so the UI doesn't dig
+    // through nested arrays.
+    type Row = {
+      id: string; body: string; kind: string; is_resolved: boolean; created_at: string;
+      node_id: string; author_id: string;
+      users?: { profiles?: { display_name?: string; username?: string; avatar_url?: string } | null } | null;
+      nodes?: { id: string; title: string; modules?: { id: string; courses?: { id: string; title: string; creator_id: string } | { id: string; title: string; creator_id: string }[] } | { id: string; courses?: unknown }[] } | null;
+    };
+    const one = <T,>(v: T | T[] | null | undefined): T | undefined => (Array.isArray(v) ? v[0] : v ?? undefined);
+    const items = (data as Row[] | null || []).map((r) => {
+      const node = r.nodes;
+      const mod = one(node?.modules);
+      const course = one((mod as { courses?: unknown } | undefined)?.courses) as { id: string; title: string } | undefined;
+      return {
+        id: r.id, body: r.body, kind: r.kind, is_resolved: r.is_resolved, created_at: r.created_at,
+        node_id: r.node_id, author_id: r.author_id,
+        node_title: node?.title || "",
+        course_id: course?.id || "",
+        course_title: course?.title || "",
+        profiles: r.users?.profiles || null,
+      };
+    });
+    return { items, total: count || 0, openCount: openRes.count || 0, resolvedCount: resolvedRes.count || 0 };
+  }, { items: [], total: 0, openCount: 0, resolvedCount: 0 });
+  ok(res, result.items, { page, pageSize, total: result.total, openCount: result.openCount, resolvedCount: result.resolvedCount });
+});
+
+const CommentCreate = z.object({
+  body: z.string().min(1).max(5000),
+  parentId: z.string().optional(),
+  kind: z.enum(["comment", "doubt"]).optional().default("comment"),
+});
+app.post("/nodes/:nodeId/comments", requireAuth, async (req, res) => {
+  const parsed = CommentCreate.safeParse(req.body);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message, "VALIDATION");
+  const { body, parentId, kind } = parsed.data;
+  const result = await withDb(async (db) => {
+    const { data, error } = await db.from("comments").insert({
+      node_id: req.params.nodeId, author_id: req.user!.id, body, parent_id: parentId || null, kind,
+    }).select("*").single();
+    if (error) throw error;
+    // Doubts must reach the creator even in local dev where Redis (the event bus)
+    // is not running. We do a synchronous notification insert here, joining
+    // node→module→course in a single nested read so it stays cheap.
+    if (kind === "doubt" && !parentId) {
+      const { data: target } = await db.from("nodes")
+        .select("modules!inner(course_id, courses!inner(title, creator_id))")
+        .eq("id", req.params.nodeId)
+        .maybeSingle();
+      // Supabase returns related rows as either an object or array — flatten.
+      type T = { course_id: string; title: string; creator_id: string };
+      const flat = (v: unknown): T | undefined => {
+        const m = (v as { modules?: unknown })?.modules;
+        const mod = Array.isArray(m) ? m[0] : m;
+        const c = (mod as { courses?: unknown })?.courses;
+        const course = Array.isArray(c) ? c[0] : c;
+        const modOne = mod as { course_id?: string } | undefined;
+        if (!modOne || !course) return undefined;
+        return { course_id: modOne.course_id!, title: (course as { title: string }).title, creator_id: (course as { creator_id: string }).creator_id };
+      };
+      const t = flat(target);
+      // Don't ping yourself if you ask a doubt on your own course.
+      if (t && t.creator_id !== req.user!.id) {
+        await db.from("notifications").insert({
+          user_id: t.creator_id,
+          type: "doubt",
+          title: "New doubt on your course",
+          body: `On ${t.title}`,
+          // Deeplink: opens the player on the right lesson and focuses the doubt
+          // (Player reads ?focus and scrolls + highlights).
+          href: `/course/${t.course_id}/learn/${req.params.nodeId}?focus=${(data as { id: string }).id}`,
+        });
+        await sendRealtimeNotification(t.creator_id, { type: "doubt", nodeId: req.params.nodeId });
+      }
+    } else if (parentId) {
+      // Reply path: tell the parent comment's author (typically the learner who
+      // asked the doubt) that someone — usually the creator — answered them.
+      const { data: parent } = await db.from("comments").select("id, author_id, kind, node_id").eq("id", parentId).maybeSingle();
+      if (parent && parent.author_id !== req.user!.id) {
+        const courseId = await nodeCourseId(db, String(req.params.nodeId));
+        const { data: course } = courseId
+          ? await db.from("courses").select("title, creator_id").eq("id", courseId).maybeSingle()
+          : { data: null };
+        const isCreatorReply = !!course && (course as { creator_id?: string }).creator_id === req.user!.id;
+        await db.from("notifications").insert({
+          user_id: parent.author_id,
+          type: "doubt_reply",
+          title: isCreatorReply ? "The creator replied to you" : "New reply to your post",
+          body: course?.title ? `In ${(course as { title: string }).title}` : "You have a new reply",
+          href: `/course/${courseId}/learn/${req.params.nodeId}?focus=${parentId}`,
+          payload: { commentId: (data as { id: string }).id, parentId },
+        });
+        await sendRealtimeNotification(parent.author_id, { type: "doubt_reply", nodeId: req.params.nodeId });
+      }
+    }
+    return data;
+  }, () => ({ id: `c-${Date.now()}`, node_id: req.params.nodeId, body, kind }));
+  await publish(parentId ? Topics.COMMENT_REPLIED : Topics.COMMENT_CREATED, {
+    commentId: (result as { id: string }).id, nodeId: req.params.nodeId, authorId: req.user!.id, kind,
+  });
+  ok(res, result);
+});
+
+app.post("/comments/:id/upvote", requireAuth, async (req, res) => {
+  await withDb(async (db) => {
+    const { error } = await db.from("comment_upvotes").insert({ comment_id: req.params.id, user_id: req.user!.id });
+    if (!error) await db.rpc("increment_upvote", { comment_id: req.params.id }).single();
+    return null;
+  }, null);
+  ok(res, { upvoted: true });
+});
+
+// Resolve / reopen a doubt. Only the course owner, an accepted collaborator,
+// or an admin may flip resolution state; the doubt's author is notified.
+async function setDoubtResolution(req: ExpressRequest, resolved: boolean): Promise<
+  | { error: { status: number; message: string; code: string } }
+  | { resolved: boolean; changed: boolean }
+> {
+  const commentId = String(req.params.id);
+  return withDb<{ error: { status: number; message: string; code: string } } | { resolved: boolean; changed: boolean }>(async (db) => {
+    const { data: comment } = await db.from("comments").select("id, node_id, author_id, is_resolved").eq("id", commentId).maybeSingle();
+    if (!comment) return { error: { status: 404, message: "Comment not found", code: "NOT_FOUND" } };
+    const courseId = await nodeCourseId(db, comment.node_id);
+    if (!courseId) return { error: { status: 404, message: "Lesson not found", code: "NOT_FOUND" } };
+    const role = await courseEditorRole(db, courseId, req.user!.id, req.user!.role === "admin");
+    if (!role) return { error: { status: 403, message: "Only the course owner, collaborators or admins can do this", code: "NOT_EDITOR" } };
+    if (comment.is_resolved === resolved) return { resolved, changed: false };
+
+    await db.from("comments").update({ is_resolved: resolved }).eq("id", commentId);
+    if (comment.author_id !== req.user!.id) {
+      const { data: course } = await db.from("courses").select("title").eq("id", courseId).maybeSingle();
+      await db.from("notifications").insert({
+        user_id: comment.author_id,
+        type: resolved ? "doubt_resolved" : "doubt_reopened",
+        title: resolved ? "Your doubt was marked resolved" : "Your doubt was reopened",
+        body: course?.title ? `In ${course.title}` : "Check the lesson discussion for updates.",
+        href: `/course/${courseId}/learn/${comment.node_id}?focus=${commentId}`,
+      });
+      await sendRealtimeNotification(comment.author_id, { type: resolved ? "doubt_resolved" : "doubt_reopened", commentId });
+    }
+    return { resolved, changed: true };
+  }, { resolved, changed: true });
+}
+
+app.post("/comments/:id/resolve", requireRole("creator", "admin"), async (req, res) => {
+  const result = await setDoubtResolution(req, true);
+  if ("error" in result) return fail(res, result.error.status, result.error.message, result.error.code);
+  ok(res, result);
+});
+
+app.post("/comments/:id/reopen", requireRole("creator", "admin"), async (req, res) => {
+  const result = await setDoubtResolution(req, false);
+  if ("error" in result) return fail(res, result.error.status, result.error.message, result.error.code);
+  ok(res, result);
+});
+
+registerBookmarkRoutes(app);
+
+registerCollaborationRoutes(app);
+
+registerCourseLockRoutes(app);
+
+// ─── Storage quota endpoints ──────────────────────────────────────
+app.get("/storage/admin/overview", requireRole("admin"), async (_req, res) => {
+  const data = await withDb(async (db) => {
+    const { data: overview, error } = await db.rpc("admin_storage_overview");
+    if (error) throw error;
+    return overview as Record<string, unknown>;
+  }, {
+    databaseBytes: 0,
+    supabaseStorageBytes: 0,
+    supabaseStorageObjects: 0,
+    supabaseStorageByBucket: [],
+    trackedUploadBytes: 0,
+    trackedUploadObjects: 0,
+    trackedUploadByBucket: [],
+    creatorStorageBytes: 0,
+    staticWebsiteBytes: 0,
+    pendingUploadBytes: 0,
+    activePurchasedBytes: 0,
+    generatedAt: new Date().toISOString(),
+  });
+  ok(res, data);
+});
+
+// Read-only view of the caller's current usage + pricing. Frontend
+// renders the "75% full · buy 5 MB" indicator from this.
+app.get("/storage/usage", requireRole("creator", "admin"), async (req, res) => {
+  const state = await withDb(async (db) => getCreatorStorage(db, req.user!.id), () => ({
+    bytes_used: 0, extra_bytes: 0, extra_until: null,
+    effective_extra_bytes: 0,
+    quota_bytes: STORAGE_FREE_MB * BYTES_PER_MB,
+    remaining_bytes: STORAGE_FREE_MB * BYTES_PER_MB,
+  } as StorageState));
+  ok(res, {
+    bytesUsed: state.bytes_used,
+    quotaBytes: state.quota_bytes,
+    remainingBytes: state.remaining_bytes,
+    freeMb: STORAGE_FREE_MB,
+    extraBytes: state.effective_extra_bytes,
+    extraUntil: state.extra_until,
+    pricing: {
+      pricePerMbInr: STORAGE_PRICE_PER_MB_INR,
+      durationDays: STORAGE_DURATION_DAYS,
+    },
+  });
+});
+
+// Create a Razorpay order to buy N MB. Frontend hands order_id +
+// amount to the Razorpay checkout widget; verification happens via
+// POST /storage/verify once the user pays.
+const PurchaseBody = z.object({ mb: z.number().int().min(1).max(500) });
+app.post("/storage/purchase", requireRole("creator", "admin"), async (req, res) => {
+  const parsed = PurchaseBody.safeParse(req.body);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message, "VALIDATION");
+  const mb = parsed.data.mb;
+  const amountInr = mb * STORAGE_PRICE_PER_MB_INR;
+  const amountPaise = amountInr * 100;
+  let orderId: string;
+  if (isRazorpayConfigured()) {
+    try {
+      const order = await razorpay().orders.create({
+        amount: amountPaise, currency: "INR",
+        receipt: `stor_${req.user!.id.slice(0, 8)}_${Date.now()}`,
+        notes: { purpose: "creator_storage", creator_id: req.user!.id, mb: String(mb) },
+      });
+      orderId = order.id;
+    } catch {
+      return fail(res, 503, "Payment provider unavailable, try again", "RAZORPAY_DOWN");
+    }
+  } else {
+    orderId = `order_dev_${Date.now()}`;
+  }
+  await withDb(async (db) => {
+    await db.from("storage_purchases").insert({
+      creator_id: req.user!.id, mb, amount_paise: amountPaise,
+      razorpay_order_id: orderId, status: "pending",
+    });
+    return null;
+  }, null);
+  ok(res, {
+    orderId, amountPaise, currency: "INR", mb,
+    keyId: process.env.RAZORPAY_KEY_ID || "rzp_test_dev",
+  });
+});
+
+// Verify the Razorpay signature on a completed payment and grant the MB.
+// Pricing/duration come from env so a single source of truth — even if
+// the client lies about `mb`, we re-read the row from storage_purchases
+// (which we wrote at order-create time) so the granted MB is what the
+// creator actually paid for.
+const VerifyBody = z.object({
+  razorpay_order_id: z.string(),
+  razorpay_payment_id: z.string(),
+  razorpay_signature: z.string(),
+});
+app.post("/storage/verify", requireRole("creator", "admin"), async (req, res) => {
+  const parsed = VerifyBody.safeParse(req.body);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message, "VALIDATION");
+  const { razorpay_order_id, razorpay_payment_id, razorpay_signature } = parsed.data;
+
+  if (!isRazorpayConfigured() && process.env.NODE_ENV === "production") {
+    return fail(res, 503, "Payment provider not configured", "GATEWAY_OFFLINE");
+  }
+  if (isRazorpayConfigured()) {
+    const valid = verifyPaymentSignature(razorpay_order_id, razorpay_payment_id, razorpay_signature);
+    if (!valid) return fail(res, 400, "Invalid payment signature", "BAD_SIGNATURE");
+  }
+
+  // Atomic — grant_storage handles status check, extra_bytes upsert, status
+  // flip, and idempotency in one transaction. Two concurrent verifies for
+  // the same order can't double-grant.
+  const result = await withDb(async (db) => {
+    const { data, error } = await db.rpc("grant_storage", {
+      p_order_id: razorpay_order_id,
+      p_payment_id: razorpay_payment_id,
+      p_caller_id: req.user!.id,
+      p_duration_days: STORAGE_DURATION_DAYS,
+    });
+    if (error) throw error;
+    return Array.isArray(data) ? data[0] : data;
+  }, null);
+
+  if (!result) return fail(res, 500, "Failed", "INTERNAL");
+  if (!result.ok) {
+    if (result.reason === "Order not found") return fail(res, 404, result.reason, "NOT_FOUND");
+    if (result.reason === "Not your order") return fail(res, 403, result.reason, "FORBIDDEN");
+    return fail(res, 400, result.reason, "GRANT_FAILED");
+  }
+  if (result.already_applied) return ok(res, { ok: true, alreadyApplied: true });
+  ok(res, { granted_mb: result.granted_mb, extra_until: result.extra_until });
+});
+
+// Catch-all course fetch — MUST be last. Express matches in registration
+// order, so any literal one-segment GET path declared above wins over this.
+// Full course CONTENT (used by the player + the creator's builder — never the
+// public marketing page, which uses /:id/detail). Gated: a node's body
+// (video_url, pdf_url, markdown, static_website, quiz answers) is returned ONLY
+// to the owner/admin, an enrolled learner with ACTIVE access, or for nodes
+// marked is_free_preview. Everyone else gets the outline (titles/types/order)
+// with bodies + quiz answers stripped — closes the "anyone reads paid content
+// and quiz answers without enrolling / after expiry" hole.
+app.get("/:id", requireAuth, async (req, res) => {
+  const c = await withDb(async (db) => {
+    const { data } = await db.from("courses").select("*, modules(*, nodes(*))").eq("id", req.params.id).maybeSingle();
+    if (!data) return null;
+    (data as { modules?: unknown }).modules = sortCourseTree((data as { modules?: (WithPosition & { nodes?: WithPosition[] | null })[] }).modules);
+
+    const isOwner = (data as { creator_id?: string }).creator_id === req.user!.id || req.user!.role === "admin";
+    let entitled = isOwner;
+    if (!entitled) {
+      const { data: enr } = await db.from("enrollments").select("access_expires_at")
+        .eq("learner_id", req.user!.id).eq("course_id", req.params.id).maybeSingle();
+      const exp = (enr as { access_expires_at?: string | null } | null)?.access_expires_at ?? null;
+      entitled = !!enr && (exp === null || new Date(exp).getTime() > Date.now());
+    }
+
+    if (!isOwner) {
+      const mods = (data as { modules?: { nodes?: Record<string, unknown>[] | null }[] }).modules || [];
+      for (const m of mods) {
+        for (const n of (m.nodes || [])) {
+          const showBody = entitled || n.is_free_preview === true;
+          if (!showBody) {
+            // Outline only — drop every content/answer-bearing field, keep metadata.
+            delete n.video_url; delete n.pdf_url; delete n.markdown; delete n.static_website;
+            delete n.quiz_payload; delete n.video_subtitles; delete n.video_chapters;
+          } else if (n.type === "quiz" && n.quiz_payload) {
+            // Quiz body IS shown (enrolled learner or free preview), but never the
+            // answer key — strip correctIndex + explanation from every question so
+            // a learner can't read the answers from the page source before
+            // attempting. The correct answers come back from the quiz-attempt
+            // response (enrollment-service) AFTER they submit, for review.
+            const qp = n.quiz_payload as { questions?: { correctIndex?: number; explanation?: string }[] };
+            for (const q of qp.questions || []) { delete q.correctIndex; delete q.explanation; }
+          }
+        }
+      }
+    }
+    return data;
+  }, () => mock.courses.find((x) => x.id === req.params.id));
+  if (!c) return fail(res, 404, "Course not found", "NOT_FOUND");
+  ok(res, c);
+});
+
+listen(PORT);
