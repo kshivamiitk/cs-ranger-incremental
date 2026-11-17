@@ -1,0 +1,36 @@
+name: Study database migration
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - database/migrations/0043_study_workspaces.sql
+      - database/tests/study-workspaces.sql
+      - scripts/test-study-db.mjs
+      - .github/workflows/study-database.yml
+  pull_request:
+    paths:
+      - database/migrations/0043_study_workspaces.sql
+      - database/tests/study-workspaces.sql
+      - scripts/test-study-db.mjs
+      - .github/workflows/study-database.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  migration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Install PostgreSQL binaries
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes postgresql libpq-dev
+      - name: Verify the migration against an isolated database
+        run: npm run test:study-db
