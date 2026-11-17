@@ -42,6 +42,7 @@ console.table(Object.fromEntries([...groups].sort(([a], [b]) => a.localeCompare(
 console.log(`Total: ${rows.length} files, ${rows.reduce((n, row) => n + row.lines, 0)} physical lines, ${rows.reduce((n, row) => n + row.nonblank, 0)} nonblank lines.\n`);
 const application = rows.filter(({ path }) =>
   /^(frontend\/src\/|backend\/[^/]+\/src\/|backend\/shared\/|database\/)/.test(path)
+  && !path.split("/").some((part) => part === "tests" || part === "__tests__")
   && !/\.(test|spec)\.[^/]+$/.test(path));
 console.log(`Application and database only: ${application.length} files, ${application.reduce((n, row) => n + row.lines, 0)} physical lines (excludes tests, utility scripts, and build/test configuration).\n`);
 console.log(`Reachable commits: ${execFileSync("git", ["rev-list", "--count", "HEAD"], { cwd: root, encoding: "utf8" }).trim()}\n`);

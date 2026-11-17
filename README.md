@@ -24,6 +24,8 @@ workflow, see [Codebase maintenance](Docs/codebase-maintenance.md). Run
 
 ## Quickstart
 
+Requires Node.js 22 or newer.
+
 ```bash
 # 1. Copy env templates and fill in real keys (see "What you need" below)
 cp .env.example .env
@@ -60,6 +62,8 @@ Open http://localhost:3000.
 Without these, the platform falls back to dev-friendly behavior: console-logged emails, in-memory mock data, and Razorpay flows that return placeholder order IDs.
 
 ## What works today
+
+- **Study workspace**: goals, planner, focus timer, flashcards, adaptive reviews, and private persistent storage. See [setup and validation](Docs/study-workspace.md).
 
 - **Auth**: real signup with bcrypt + email verification, login with JWT + rotating refresh, forgot/reset password.
 - **Courses**: 5-step builder creates real courses with all 5 node types (video / markdown / quiz / pdf / static-website). Static-website uses Monaco editor with sandboxed iframe preview.
