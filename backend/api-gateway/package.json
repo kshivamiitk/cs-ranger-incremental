@@ -1,0 +1,20 @@
+{
+  "name": "@cs-ranger/api-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "@cs-ranger/shared": "*",
+    "cors": "^2.8.5",
+    "express": "^5.0.1",
+    "http-proxy-middleware": "^3.0.7",
+    "jsonwebtoken": "^9.0.2"
+  },
+  "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.7"
+  }
+}
